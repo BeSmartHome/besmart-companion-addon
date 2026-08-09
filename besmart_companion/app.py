@@ -4,6 +4,7 @@ import os
 import select
 import socket
 import subprocess
+import time
 import uuid
 import urllib.error
 import urllib.request
@@ -196,6 +197,16 @@ class Handler(BaseHTTPRequestHandler):
                 funnel_url = tailscale_dns_url() or read_remote_url() or expected_url
                 if funnel_url:
                     store_remote_url(funnel_url)
+                    remote_ready = wait_for_remote_https_ready(funnel_url, effective_remote_token)
+                    if not remote_ready.get("ok"):
+                        self._json(504, {
+                            "ok": False,
+                            "ip": ip,
+                            "url": funnel_url,
+                            "error": "remote_https_timeout",
+                            "remote_ready": remote_ready
+                        })
+                        return
 
             self._json(200, {
                 "ok": True,
@@ -203,6 +214,7 @@ class Handler(BaseHTTPRequestHandler):
                 "server_id": server_id,
                 "url": funnel_url or (f"http://{ip}:8123" if ip else None),
                 "remote_token": read_remote_token(),
+                "remote_ready": True if funnel_url else None,
                 "serve_target_url": serve_target_url if enable_funnel else None,
                 "ha_upstream_url": ha_upstream_url if enable_funnel else None
             })
@@ -407,6 +419,42 @@ def tunnel_sockets(client_socket, upstream_socket):
                 target.sendall(data)
             except OSError:
                 return
+
+
+def wait_for_remote_https_ready(remote_url, remote_token, timeout=75):
+    if not remote_url or not remote_token:
+        return {"ok": False, "error": "missing_remote_url_or_token"}
+
+    deadline = time.monotonic() + timeout
+    probe_url = f"{remote_url.rstrip('/')}/api/"
+    last_error = None
+    print(f"Waiting for Tailscale Funnel HTTPS url={probe_url}", flush=True)
+
+    while time.monotonic() < deadline:
+        request = urllib.request.Request(
+            probe_url,
+            headers={
+                REMOTE_TOKEN_HEADER: remote_token,
+                "Accept": "application/json"
+            }
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                print(f"Tailscale Funnel HTTPS ready status={response.status}", flush=True)
+                return {"ok": True, "status": response.status}
+        except urllib.error.HTTPError as error:
+            if error.code in (401, 403):
+                print(f"Tailscale Funnel HTTPS ready status={error.code}", flush=True)
+                return {"ok": True, "status": error.code}
+            last_error = f"http_{error.code}"
+        except Exception as error:
+            last_error = str(error)
+
+        time.sleep(2)
+
+    print(f"Tailscale Funnel HTTPS not ready error={last_error}", flush=True)
+    return {"ok": False, "error": last_error or "timeout"}
 
 
 def store_remote_token(token):
