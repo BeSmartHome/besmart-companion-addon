@@ -1,6 +1,8 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
+import select
+import socket
 import subprocess
 import uuid
 import urllib.error
@@ -221,6 +223,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json(403, {"error": "forbidden"})
             return
 
+        if is_websocket_upgrade(self.headers):
+            self._proxy_home_assistant_websocket(ha_path, parsed_remote_path.query)
+            return
+
         target_url = f"{read_ha_upstream()}{ha_path}"
         if parsed_remote_path.query:
             target_url = f"{target_url}?{parsed_remote_path.query}"
@@ -260,6 +266,61 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as error:
             self._json(502, {"error": str(error)})
 
+    def _proxy_home_assistant_websocket(self, ha_path, query):
+        upstream = urlparse(read_ha_upstream())
+        upstream_host = upstream.hostname or "127.0.0.1"
+        upstream_port = upstream.port or 8123
+        upstream_path = ha_path
+        if query:
+            upstream_path = f"{upstream_path}?{query}"
+
+        try:
+            with socket.create_connection((upstream_host, upstream_port), timeout=10) as upstream_socket:
+                upstream_socket.settimeout(None)
+                self.connection.settimeout(None)
+                upstream_socket.sendall(self._websocket_upgrade_request(upstream_path, upstream_host, upstream_port))
+
+                response = read_http_headers(upstream_socket)
+                if not response:
+                    self._json(502, {"error": "websocket_upstream_no_response"})
+                    return
+
+                self.connection.sendall(response)
+                if not response.startswith(b"HTTP/1.1 101") and not response.startswith(b"HTTP/1.0 101"):
+                    return
+
+                tunnel_sockets(self.connection, upstream_socket)
+        except Exception as error:
+            try:
+                self._json(502, {"error": str(error)})
+            except Exception:
+                pass
+
+    def _websocket_upgrade_request(self, upstream_path, upstream_host, upstream_port):
+        headers = [
+            f"GET {upstream_path} HTTP/1.1",
+            f"Host: {upstream_host}:{upstream_port}",
+        ]
+
+        hop_by_hop_headers = {
+            "host",
+            "connection",
+            "upgrade",
+            "x-besmart-remote-token"
+        }
+        for key, value in self.headers.items():
+            if key.lower() in hop_by_hop_headers:
+                continue
+            headers.append(f"{key}: {value}")
+
+        headers.extend([
+            "Connection: Upgrade",
+            "Upgrade: websocket",
+            "",
+            ""
+        ])
+        return "\r\n".join(headers).encode("utf-8")
+
 
 def normalize_companion_target(value):
     if not value:
@@ -294,6 +355,7 @@ def is_allowed_ha_path(path):
     allowed_exact = {
         "/api/",
         "/api/states",
+        "/api/websocket",
         "/api/config/energy"
     }
     allowed_prefixes = (
@@ -305,6 +367,46 @@ def is_allowed_ha_path(path):
         return True
 
     return any(path.startswith(prefix) for prefix in allowed_prefixes)
+
+
+def is_websocket_upgrade(headers):
+    connection = headers.get("Connection", "")
+    upgrade = headers.get("Upgrade", "")
+    return "upgrade" in connection.lower() and upgrade.lower() == "websocket"
+
+
+def read_http_headers(source_socket):
+    buffer = b""
+    while b"\r\n\r\n" not in buffer:
+        chunk = source_socket.recv(4096)
+        if not chunk:
+            break
+        buffer += chunk
+        if len(buffer) > 65536:
+            break
+    return buffer
+
+
+def tunnel_sockets(client_socket, upstream_socket):
+    sockets = [client_socket, upstream_socket]
+    while True:
+        readable, _, exceptional = select.select(sockets, [], sockets, 300)
+        if exceptional:
+            return
+        if not readable:
+            return
+        for source in readable:
+            try:
+                data = source.recv(65536)
+            except OSError:
+                return
+            if not data:
+                return
+            target = upstream_socket if source is client_socket else client_socket
+            try:
+                target.sendall(data)
+            except OSError:
+                return
 
 
 def store_remote_token(token):
