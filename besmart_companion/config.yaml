@@ -1,12 +1,10 @@
 name: "BeSmart Companion"
 slug: "besmart_companion"
 description: "Local setup companion for BeSmart Home Server"
-version: "0.1.17"
+version: "0.1.18"
 
 arch:
   - aarch64
-
-image: "ghcr.io/besmarthome/besmart-companion-{arch}"
 
 init: false
 startup: services
