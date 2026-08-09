@@ -267,22 +267,31 @@ class Handler(BaseHTTPRequestHandler):
         headers = [
             f"GET {upstream_path} HTTP/1.1",
             f"Host: {upstream_host}:{upstream_port}",
-        ]
-
-        hop_by_hop_headers = {
-            "host",
-            "connection",
-            "upgrade",
-            "x-besmart-remote-token"
-        }
-        for key, value in self.headers.items():
-            if key.lower() in hop_by_hop_headers:
-                continue
-            headers.append(f"{key}: {value}")
-
-        headers.extend([
             "Connection: Upgrade",
             "Upgrade: websocket",
+        ]
+
+        forwarded_headers = (
+            "Sec-WebSocket-Key",
+            "Sec-WebSocket-Version",
+            "Sec-WebSocket-Protocol",
+            "Sec-WebSocket-Extensions",
+            "Origin"
+        )
+        for header in forwarded_headers:
+            value = self.headers.get(header)
+            if value:
+                headers.append(f"{header}: {value}")
+
+        missing_headers = [
+            header
+            for header in ("Sec-WebSocket-Key", "Sec-WebSocket-Version")
+            if not self.headers.get(header)
+        ]
+        if missing_headers:
+            print(f"WebSocket upgrade missing headers={missing_headers}", flush=True)
+
+        headers.extend([
             "",
             ""
         ])
