@@ -136,7 +136,15 @@ class Handler(BaseHTTPRequestHandler):
                 store_server_id(server_id)
                 store_remote_token(remote_token)
                 store_ha_upstream(ha_upstream_url)
-                print(f"Enabling Tailscale Funnel target={serve_target_url}", flush=True)
+                funnel_target = str(urlparse(serve_target_url).port or PORT)
+                print(f"Resetting previous Tailscale Funnel config", flush=True)
+                subprocess.run(
+                    ["tailscale", "funnel", "reset"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                print(f"Enabling Tailscale Funnel target={funnel_target}", flush=True)
                 try:
                     funnel_result = subprocess.run(
                         [
@@ -145,7 +153,7 @@ class Handler(BaseHTTPRequestHandler):
                             "--https=443",
                             "--bg",
                             "--yes",
-                            serve_target_url
+                            funnel_target
                         ],
                         capture_output=True,
                         text=True,
