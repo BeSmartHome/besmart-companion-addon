@@ -1,8 +1,10 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import subprocess
+from urllib.parse import urlparse
 
 PORT = 8765
+DEFAULT_HOME_ASSISTANT_URL = "http://127.0.0.1:8123"
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -58,6 +60,9 @@ class Handler(BaseHTTPRequestHandler):
 
             auth_key = data.get("auth_key")
             hostname = data.get("hostname", "besmart-home")
+            enable_funnel = bool(data.get("enable_funnel", False))
+            serve_target_url = normalize_serve_target(data.get("serve_target_url"))
+            expected_url = data.get("expected_url")
 
             if not auth_key:
                 self._json(400, {"error": "missing_auth_key"})
@@ -68,7 +73,8 @@ class Handler(BaseHTTPRequestHandler):
                     "tailscale",
                     "up",
                     "--authkey", auth_key,
-                    "--hostname", hostname
+                    "--hostname", hostname,
+                    "--accept-dns=true"
                 ],
                 capture_output=True,
                 text=True
@@ -89,15 +95,76 @@ class Handler(BaseHTTPRequestHandler):
 
             lines = ip_result.stdout.strip().splitlines()
             ip = lines[0] if lines else None
+            funnel_url = None
+
+            if enable_funnel:
+                funnel_result = subprocess.run(
+                    [
+                        "tailscale",
+                        "funnel",
+                        "--bg",
+                        "--yes",
+                        serve_target_url
+                    ],
+                    capture_output=True,
+                    text=True
+                )
+
+                if funnel_result.returncode != 0:
+                    self._json(500, {
+                        "ok": False,
+                        "ip": ip,
+                        "error": funnel_result.stderr or funnel_result.stdout or "failed_to_enable_funnel"
+                    })
+                    return
+
+                funnel_url = expected_url or tailscale_dns_url()
 
             self._json(200, {
                 "ok": True,
                 "ip": ip,
-                "url": f"http://{ip}:8123" if ip else None
+                "url": funnel_url or (f"http://{ip}:8123" if ip else None),
+                "serve_target_url": serve_target_url if enable_funnel else None
             })
             return
 
         self._json(404, {"error": "not_found"})
+
+
+def normalize_serve_target(value):
+    if not value:
+        return DEFAULT_HOME_ASSISTANT_URL
+
+    target = str(value).strip().rstrip("/")
+    parsed = urlparse(target)
+
+    if parsed.scheme not in ("http", "https"):
+        return DEFAULT_HOME_ASSISTANT_URL
+
+    port = parsed.port or 8123
+    path = parsed.path.rstrip("/")
+    return f"http://127.0.0.1:{port}{path}"
+
+
+def tailscale_dns_url():
+    result = subprocess.run(
+        ["tailscale", "status", "--json"],
+        capture_output=True,
+        text=True
+    )
+    if result.returncode != 0 or not result.stdout:
+        return None
+
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+
+    dns_name = data.get("Self", {}).get("DNSName")
+    if not dns_name:
+        return None
+
+    return f"https://{dns_name.rstrip('.')}"
 
 
 print(f"BeSmart Companion listening on port {PORT}")
