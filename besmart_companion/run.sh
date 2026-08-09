@@ -1,10 +1,11 @@
-#!/usr/bin/with-contenv sh
+#!/bin/sh
 
 set -e
 
 echo "Starting BeSmart Companion..."
 
 mkdir -p /var/lib/tailscale
+mkdir -p /var/run/tailscale
 
 tailscaled \
   --tun=userspace-networking \
@@ -13,6 +14,6 @@ tailscaled \
 
 sleep 3
 
-echo "Starting BeSmart API..."
+echo "Starting BeSmart API on port 8765..."
 
 exec python3 /app/app.py
