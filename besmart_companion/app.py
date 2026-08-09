@@ -2,6 +2,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 import subprocess
+import uuid
 import urllib.error
 import urllib.request
 from urllib.parse import urlparse
@@ -37,6 +38,14 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {
                 "status": "ok",
                 "service": "besmart-companion"
+            })
+            return
+
+        if self.path == "/identity":
+            self._json(200, {
+                "server_id": get_or_create_server_id(),
+                "remote_url": read_remote_url(),
+                "tailscale_dns_name": tailscale_dns_name(read_tailscale_status())
             })
             return
 
@@ -76,7 +85,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             auth_key = data.get("auth_key")
-            server_id = data.get("server_id")
+            server_id = data.get("server_id") or get_or_create_server_id()
             hostname = data.get("hostname", "besmart-home")
             enable_funnel = bool(data.get("enable_funnel", False))
             serve_target_url = normalize_companion_target(data.get("serve_target_url"))
@@ -92,34 +101,38 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": "missing_remote_token"})
                 return
 
-            print(f"Connecting Tailscale hostname={hostname} funnel={enable_funnel}", flush=True)
-            try:
-                result = subprocess.run(
-                    [
-                        "tailscale",
-                        "up",
-                        "--authkey", auth_key,
-                        "--hostname", hostname,
-                        "--accept-dns=true"
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=60
-                )
-            except subprocess.TimeoutExpired:
-                self._json(504, {
-                    "ok": False,
-                    "error": "tailscale_up_timeout"
-                })
-                return
-            print(f"tailscale up finished rc={result.returncode}", flush=True)
+            current_status = read_tailscale_status()
+            if tailscale_is_running(current_status):
+                print(f"Reusing existing Tailscale login dns={tailscale_dns_name(current_status)}", flush=True)
+            else:
+                print(f"Connecting Tailscale hostname={hostname} funnel={enable_funnel}", flush=True)
+                try:
+                    result = subprocess.run(
+                        [
+                            "tailscale",
+                            "up",
+                            "--authkey", auth_key,
+                            "--hostname", hostname,
+                            "--accept-dns=true"
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=60
+                    )
+                except subprocess.TimeoutExpired:
+                    self._json(504, {
+                        "ok": False,
+                        "error": "tailscale_up_timeout"
+                    })
+                    return
+                print(f"tailscale up finished rc={result.returncode}", flush=True)
 
-            if result.returncode != 0:
-                self._json(500, {
-                    "ok": False,
-                    "error": result.stderr
-                })
-                return
+                if result.returncode != 0:
+                    self._json(500, {
+                        "ok": False,
+                        "error": result.stderr
+                    })
+                    return
 
             ip_result = subprocess.run(
                 ["tailscale", "ip", "-4"],
@@ -178,7 +191,9 @@ class Handler(BaseHTTPRequestHandler):
                     })
                     return
 
-                funnel_url = tailscale_dns_url() or expected_url
+                funnel_url = tailscale_dns_url() or read_remote_url() or expected_url
+                if funnel_url:
+                    store_remote_url(funnel_url)
 
             self._json(200, {
                 "ok": True,
@@ -307,6 +322,38 @@ def store_server_id(server_id):
         file.write(str(server_id).strip())
 
 
+def get_or_create_server_id():
+    try:
+        with open(SERVER_ID_FILE, "r", encoding="utf-8") as file:
+            value = file.read().strip()
+            if value:
+                return value
+    except FileNotFoundError:
+        pass
+
+    value = f"srv_{uuid.uuid4().hex[:12]}"
+    store_server_id(value)
+    return value
+
+
+def remote_url_file():
+    return "/data/besmart_remote_url"
+
+
+def store_remote_url(url):
+    os.makedirs(os.path.dirname(remote_url_file()), exist_ok=True)
+    with open(remote_url_file(), "w", encoding="utf-8") as file:
+        file.write(str(url).strip())
+
+
+def read_remote_url():
+    try:
+        with open(remote_url_file(), "r", encoding="utf-8") as file:
+            return file.read().strip() or None
+    except FileNotFoundError:
+        return None
+
+
 def read_remote_token():
     try:
         with open(REMOTE_TOKEN_FILE, "r", encoding="utf-8") as file:
@@ -331,6 +378,14 @@ def read_ha_upstream():
 
 
 def tailscale_dns_url():
+    dns_name = tailscale_dns_name(read_tailscale_status())
+    if not dns_name:
+        return None
+
+    return f"https://{dns_name.rstrip('.')}{REMOTE_PREFIX}"
+
+
+def read_tailscale_status():
     result = subprocess.run(
         ["tailscale", "status", "--json"],
         capture_output=True,
@@ -340,15 +395,21 @@ def tailscale_dns_url():
         return None
 
     try:
-        data = json.loads(result.stdout)
+        return json.loads(result.stdout)
     except json.JSONDecodeError:
         return None
 
-    dns_name = data.get("Self", {}).get("DNSName")
-    if not dns_name:
+
+def tailscale_is_running(status_data):
+    return bool(status_data and status_data.get("BackendState") == "Running" and tailscale_dns_name(status_data))
+
+
+def tailscale_dns_name(status_data):
+    if not status_data:
         return None
 
-    return f"https://{dns_name.rstrip('.')}{REMOTE_PREFIX}"
+    dns_name = status_data.get("Self", {}).get("DNSName")
+    return dns_name or None
 
 
 print(f"BeSmart Companion listening on port {PORT}")
