@@ -353,7 +353,7 @@ def tailscale_dns_url():
     if not dns_name:
         return None
 
-    return f"https://{dns_name.rstrip('.')}"
+    return f"https://{dns_name.rstrip('.')}{REMOTE_PREFIX}"
 
 
 print(f"BeSmart Companion listening on port {PORT}")
