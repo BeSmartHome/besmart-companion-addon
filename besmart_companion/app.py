@@ -105,7 +105,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             current_status = read_tailscale_status()
-            if tailscale_is_running(current_status):
+            reused_existing_login = tailscale_is_running(current_status)
+            if reused_existing_login:
                 print(f"Reusing existing Tailscale login dns={tailscale_dns_name(current_status)}", flush=True)
             else:
                 up_result = run_tailscale_up(auth_key, hostname, enable_funnel)
@@ -113,15 +114,7 @@ class Handler(BaseHTTPRequestHandler):
                     self._json(up_result.get("status", 500), up_result)
                     return
 
-            ip_result = subprocess.run(
-                ["tailscale", "ip", "-4"],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-
-            lines = ip_result.stdout.strip().splitlines()
-            ip = lines[0] if lines else None
+            ip = read_tailscale_ip()
             funnel_url = None
 
             if enable_funnel:
@@ -141,6 +134,17 @@ class Handler(BaseHTTPRequestHandler):
                     store_remote_url(funnel_url)
                     remote_ready = wait_for_remote_https_ready(funnel_url, effective_remote_token)
                     if not remote_ready.get("ok"):
+                        if not reused_existing_login:
+                            self._json(504, {
+                                "ok": False,
+                                "ip": ip,
+                                "url": funnel_url,
+                                "error": "remote_https_timeout",
+                                "remote_ready": remote_ready,
+                                "recovered_stale_login": False
+                            })
+                            return
+
                         print("Remote HTTPS not ready; resetting stale Tailscale login and retrying once", flush=True)
                         reset_tailscale_login()
                         up_result = run_tailscale_up(auth_key, hostname, enable_funnel)
@@ -399,7 +403,7 @@ def tunnel_sockets(client_socket, upstream_socket):
                 return
 
 
-def wait_for_remote_https_ready(remote_url, remote_token, timeout=75):
+def wait_for_remote_https_ready(remote_url, remote_token, timeout=150):
     if not remote_url or not remote_token:
         return {"ok": False, "error": "missing_remote_url_or_token"}
 
