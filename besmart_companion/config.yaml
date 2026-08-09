@@ -6,10 +6,11 @@ version: "0.1.16"
 arch:
   - aarch64
 
+image: "ghcr.io/besmarthome/besmart-companion-{arch}"
+
 init: false
 startup: services
 boot: auto
-
 host_network: true
 
 options: {}
