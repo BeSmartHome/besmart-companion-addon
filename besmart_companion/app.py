@@ -133,17 +133,11 @@ class Handler(BaseHTTPRequestHandler):
             funnel_url = None
 
             if enable_funnel:
+                effective_remote_token = read_remote_token() or remote_token
                 store_server_id(server_id)
-                store_remote_token(remote_token)
+                store_remote_token(effective_remote_token)
                 store_ha_upstream(ha_upstream_url)
                 funnel_target = str(urlparse(serve_target_url).port or PORT)
-                print(f"Resetting previous Tailscale Funnel config", flush=True)
-                subprocess.run(
-                    ["tailscale", "funnel", "reset"],
-                    capture_output=True,
-                    text=True,
-                    timeout=10
-                )
                 print(f"Enabling Tailscale Funnel target={funnel_target}", flush=True)
                 try:
                     funnel_result = subprocess.run(
@@ -191,6 +185,7 @@ class Handler(BaseHTTPRequestHandler):
                 "ip": ip,
                 "server_id": server_id,
                 "url": funnel_url or (f"http://{ip}:8123" if ip else None),
+                "remote_token": read_remote_token(),
                 "serve_target_url": serve_target_url if enable_funnel else None,
                 "ha_upstream_url": ha_upstream_url if enable_funnel else None
             })
