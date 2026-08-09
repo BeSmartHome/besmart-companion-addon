@@ -4,6 +4,7 @@ import os
 import select
 import socket
 import subprocess
+import threading
 import time
 import uuid
 import urllib.error
@@ -18,16 +19,20 @@ REMOTE_TOKEN_FILE = "/data/besmart_remote_token"
 HA_UPSTREAM_FILE = "/data/besmart_ha_upstream"
 SERVER_ID_FILE = "/data/besmart_server_id"
 REMOTE_TOKEN_HEADER = "X-BeSmart-Remote-Token"
+TAILSCALE_CONNECT_LOCK = threading.Lock()
 
 
 class Handler(BaseHTTPRequestHandler):
     def _json(self, status, payload):
         body = json.dumps(payload).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except BrokenPipeError:
+            print(f"Client disconnected before JSON response status={status}", flush=True)
 
     def log_message(self, format, *args):
         print(f"{self.client_address[0]} - {format % args}")
@@ -104,92 +109,104 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": "missing_remote_token"})
                 return
 
-            current_status = read_tailscale_status()
-            reused_existing_login = tailscale_is_running(current_status)
-            if reused_existing_login:
-                print(f"Reusing existing Tailscale login dns={tailscale_dns_name(current_status)}", flush=True)
-            else:
-                up_result = run_tailscale_up(auth_key, hostname, enable_funnel)
-                if not up_result.get("ok"):
-                    self._json(up_result.get("status", 500), up_result)
-                    return
+            if not TAILSCALE_CONNECT_LOCK.acquire(blocking=False):
+                self._json(409, {
+                    "ok": False,
+                    "error": "tailscale_connect_in_progress",
+                    "message": "Remote access setup is already running. Wait for the current setup to finish.",
+                    "url": read_remote_url()
+                })
+                return
 
-            ip = read_tailscale_ip()
-            funnel_url = None
+            try:
+                current_status = read_tailscale_status()
+                reused_existing_login = tailscale_is_running(current_status)
+                if reused_existing_login:
+                    print(f"Reusing existing Tailscale login dns={tailscale_dns_name(current_status)}", flush=True)
+                else:
+                    up_result = run_tailscale_up(auth_key, hostname, enable_funnel)
+                    if not up_result.get("ok"):
+                        self._json(up_result.get("status", 500), up_result)
+                        return
 
-            if enable_funnel:
-                effective_remote_token = read_remote_token() or remote_token
-                store_server_id(server_id)
-                store_remote_token(effective_remote_token)
-                store_ha_upstream(ha_upstream_url)
-                funnel_target = str(urlparse(serve_target_url).port or PORT)
-                funnel_result = enable_tailscale_funnel(funnel_target)
-                if not funnel_result.get("ok"):
-                    funnel_result["ip"] = ip
-                    self._json(funnel_result.get("status", 500), funnel_result)
-                    return
+                ip = read_tailscale_ip()
+                funnel_url = None
 
-                funnel_url = tailscale_dns_url() or expected_url or read_remote_url()
-                if funnel_url:
-                    store_remote_url(funnel_url)
-                    remote_ready = wait_for_remote_https_ready(funnel_url, effective_remote_token)
-                    if not remote_ready.get("ok"):
-                        if not reused_existing_login:
-                            self._json(504, {
-                                "ok": False,
-                                "ip": ip,
-                                "url": funnel_url,
-                                "error": "remote_https_timeout",
-                                "remote_ready": remote_ready,
-                                "recovered_stale_login": False
-                            })
-                            return
+                if enable_funnel:
+                    effective_remote_token = read_remote_token() or remote_token
+                    store_server_id(server_id)
+                    store_remote_token(effective_remote_token)
+                    store_ha_upstream(ha_upstream_url)
+                    funnel_target = str(urlparse(serve_target_url).port or PORT)
+                    funnel_result = enable_tailscale_funnel(funnel_target)
+                    if not funnel_result.get("ok"):
+                        funnel_result["ip"] = ip
+                        self._json(funnel_result.get("status", 500), funnel_result)
+                        return
 
-                        print("Remote HTTPS not ready; resetting stale Tailscale login and retrying once", flush=True)
-                        reset_tailscale_login()
-                        up_result = run_tailscale_up(auth_key, hostname, enable_funnel)
-                        if not up_result.get("ok"):
-                            self._json(up_result.get("status", 500), {
-                                **up_result,
-                                "previous_url": funnel_url,
-                                "previous_remote_ready": remote_ready
-                            })
-                            return
-
-                        ip = read_tailscale_ip()
-                        funnel_result = enable_tailscale_funnel(funnel_target)
-                        if not funnel_result.get("ok"):
-                            funnel_result["ip"] = ip
-                            self._json(funnel_result.get("status", 500), funnel_result)
-                            return
-
-                        funnel_url = tailscale_dns_url() or expected_url
-                        if funnel_url:
-                            store_remote_url(funnel_url)
-                            remote_ready = wait_for_remote_https_ready(funnel_url, effective_remote_token)
-
+                    funnel_url = tailscale_dns_url() or expected_url or read_remote_url()
+                    if funnel_url:
+                        store_remote_url(funnel_url)
+                        remote_ready = wait_for_remote_https_ready(funnel_url, effective_remote_token)
                         if not remote_ready.get("ok"):
-                            self._json(504, {
-                                "ok": False,
-                                "ip": ip,
-                                "url": funnel_url,
-                                "error": "remote_https_timeout",
-                                "remote_ready": remote_ready,
-                                "recovered_stale_login": True
-                            })
-                            return
+                            if not reused_existing_login:
+                                self._json(504, {
+                                    "ok": False,
+                                    "ip": ip,
+                                    "url": funnel_url,
+                                    "error": "remote_https_timeout",
+                                    "remote_ready": remote_ready,
+                                    "recovered_stale_login": False
+                                })
+                                return
 
-            self._json(200, {
-                "ok": True,
-                "ip": ip,
-                "server_id": server_id,
-                "url": funnel_url or (f"http://{ip}:8123" if ip else None),
-                "remote_token": read_remote_token(),
-                "remote_ready": True if funnel_url else None,
-                "serve_target_url": serve_target_url if enable_funnel else None,
-                "ha_upstream_url": ha_upstream_url if enable_funnel else None
-            })
-            return
+                            print("Remote HTTPS not ready; resetting stale Tailscale login and retrying once", flush=True)
+                            reset_tailscale_login()
+                            up_result = run_tailscale_up(auth_key, hostname, enable_funnel)
+                            if not up_result.get("ok"):
+                                self._json(up_result.get("status", 500), {
+                                    **up_result,
+                                    "previous_url": funnel_url,
+                                    "previous_remote_ready": remote_ready
+                                })
+                                return
+
+                            ip = read_tailscale_ip()
+                            funnel_result = enable_tailscale_funnel(funnel_target)
+                            if not funnel_result.get("ok"):
+                                funnel_result["ip"] = ip
+                                self._json(funnel_result.get("status", 500), funnel_result)
+                                return
+
+                            funnel_url = tailscale_dns_url() or expected_url
+                            if funnel_url:
+                                store_remote_url(funnel_url)
+                                remote_ready = wait_for_remote_https_ready(funnel_url, effective_remote_token)
+
+                            if not remote_ready.get("ok"):
+                                self._json(504, {
+                                    "ok": False,
+                                    "ip": ip,
+                                    "url": funnel_url,
+                                    "error": "remote_https_timeout",
+                                    "remote_ready": remote_ready,
+                                    "recovered_stale_login": True
+                                })
+                                return
+
+                self._json(200, {
+                    "ok": True,
+                    "ip": ip,
+                    "server_id": server_id,
+                    "url": funnel_url or (f"http://{ip}:8123" if ip else None),
+                    "remote_token": read_remote_token(),
+                    "remote_ready": True if funnel_url else None,
+                    "serve_target_url": serve_target_url if enable_funnel else None,
+                    "ha_upstream_url": ha_upstream_url if enable_funnel else None
+                })
+                return
+            finally:
+                TAILSCALE_CONNECT_LOCK.release()
 
         self._json(404, {"error": "not_found"})
 
