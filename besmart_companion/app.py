@@ -184,7 +184,7 @@ class Handler(BaseHTTPRequestHandler):
                     })
                     return
 
-                funnel_url = expected_url or tailscale_dns_url()
+                funnel_url = tailscale_dns_url() or expected_url
 
             self._json(200, {
                 "ok": True,
