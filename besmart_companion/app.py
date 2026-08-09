@@ -142,6 +142,7 @@ class Handler(BaseHTTPRequestHandler):
                         [
                             "tailscale",
                             "funnel",
+                            "--https=443",
                             "--bg",
                             "--yes",
                             serve_target_url
@@ -151,10 +152,18 @@ class Handler(BaseHTTPRequestHandler):
                         timeout=60
                     )
                 except subprocess.TimeoutExpired:
+                    status_result = subprocess.run(
+                        ["tailscale", "funnel", "status", "--json"],
+                        capture_output=True,
+                        text=True,
+                        timeout=10
+                    )
                     self._json(504, {
                         "ok": False,
                         "ip": ip,
-                        "error": "tailscale_funnel_timeout"
+                        "error": "tailscale_funnel_timeout",
+                        "funnel_status": status_result.stdout or None,
+                        "funnel_status_error": status_result.stderr or None
                     })
                     return
                 print(f"tailscale funnel finished rc={funnel_result.returncode}", flush=True)
