@@ -12,6 +12,7 @@ DEFAULT_COMPANION_URL = "http://127.0.0.1:8765"
 REMOTE_PREFIX = "/remote/ha"
 REMOTE_TOKEN_FILE = "/data/besmart_remote_token"
 HA_UPSTREAM_FILE = "/data/besmart_ha_upstream"
+SERVER_ID_FILE = "/data/besmart_server_id"
 REMOTE_TOKEN_HEADER = "X-BeSmart-Remote-Token"
 
 
@@ -75,6 +76,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             auth_key = data.get("auth_key")
+            server_id = data.get("server_id")
             hostname = data.get("hostname", "besmart-home")
             enable_funnel = bool(data.get("enable_funnel", False))
             serve_target_url = normalize_companion_target(data.get("serve_target_url"))
@@ -120,6 +122,7 @@ class Handler(BaseHTTPRequestHandler):
             funnel_url = None
 
             if enable_funnel:
+                store_server_id(server_id)
                 store_remote_token(remote_token)
                 store_ha_upstream(ha_upstream_url)
                 funnel_result = subprocess.run(
@@ -147,6 +150,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {
                 "ok": True,
                 "ip": ip,
+                "server_id": server_id,
                 "url": funnel_url or (f"http://{ip}:8123" if ip else None),
                 "serve_target_url": serve_target_url if enable_funnel else None,
                 "ha_upstream_url": ha_upstream_url if enable_funnel else None
@@ -258,6 +262,15 @@ def store_remote_token(token):
     os.makedirs(os.path.dirname(REMOTE_TOKEN_FILE), exist_ok=True)
     with open(REMOTE_TOKEN_FILE, "w", encoding="utf-8") as file:
         file.write(str(token).strip())
+
+
+def store_server_id(server_id):
+    if not server_id:
+        return
+
+    os.makedirs(os.path.dirname(SERVER_ID_FILE), exist_ok=True)
+    with open(SERVER_ID_FILE, "w", encoding="utf-8") as file:
+        file.write(str(server_id).strip())
 
 
 def read_remote_token():
