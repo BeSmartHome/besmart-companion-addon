@@ -92,17 +92,27 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": "missing_remote_token"})
                 return
 
-            result = subprocess.run(
-                [
-                    "tailscale",
-                    "up",
-                    "--authkey", auth_key,
-                    "--hostname", hostname,
-                    "--accept-dns=true"
-                ],
-                capture_output=True,
-                text=True
-            )
+            print(f"Connecting Tailscale hostname={hostname} funnel={enable_funnel}", flush=True)
+            try:
+                result = subprocess.run(
+                    [
+                        "tailscale",
+                        "up",
+                        "--authkey", auth_key,
+                        "--hostname", hostname,
+                        "--accept-dns=true"
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=60
+                )
+            except subprocess.TimeoutExpired:
+                self._json(504, {
+                    "ok": False,
+                    "error": "tailscale_up_timeout"
+                })
+                return
+            print(f"tailscale up finished rc={result.returncode}", flush=True)
 
             if result.returncode != 0:
                 self._json(500, {
@@ -114,7 +124,8 @@ class Handler(BaseHTTPRequestHandler):
             ip_result = subprocess.run(
                 ["tailscale", "ip", "-4"],
                 capture_output=True,
-                text=True
+                text=True,
+                timeout=10
             )
 
             lines = ip_result.stdout.strip().splitlines()
@@ -125,17 +136,28 @@ class Handler(BaseHTTPRequestHandler):
                 store_server_id(server_id)
                 store_remote_token(remote_token)
                 store_ha_upstream(ha_upstream_url)
-                funnel_result = subprocess.run(
-                    [
-                        "tailscale",
-                        "funnel",
-                        "--bg",
-                        "--yes",
-                        serve_target_url
-                    ],
-                    capture_output=True,
-                    text=True
-                )
+                print(f"Enabling Tailscale Funnel target={serve_target_url}", flush=True)
+                try:
+                    funnel_result = subprocess.run(
+                        [
+                            "tailscale",
+                            "funnel",
+                            "--bg",
+                            "--yes",
+                            serve_target_url
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=60
+                    )
+                except subprocess.TimeoutExpired:
+                    self._json(504, {
+                        "ok": False,
+                        "ip": ip,
+                        "error": "tailscale_funnel_timeout"
+                    })
+                    return
+                print(f"tailscale funnel finished rc={funnel_result.returncode}", flush=True)
 
                 if funnel_result.returncode != 0:
                     self._json(500, {
