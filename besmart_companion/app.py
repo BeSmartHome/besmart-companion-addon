@@ -275,8 +275,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(response_body)))
             self.end_headers()
             self.wfile.write(response_body)
+        except BrokenPipeError:
+            print(f"Client disconnected while proxying {ha_path}", flush=True)
         except Exception as error:
-            self._json(502, {"error": str(error)})
+            try:
+                self._json(502, {"error": str(error)})
+            except BrokenPipeError:
+                print(f"Client disconnected before proxy error response {ha_path}: {error}", flush=True)
 
     def _proxy_home_assistant_websocket(self, ha_path, query):
         upstream = urlparse(read_ha_upstream())
@@ -287,6 +292,7 @@ class Handler(BaseHTTPRequestHandler):
             upstream_path = f"{upstream_path}?{query}"
 
         try:
+            print(f"WebSocket proxy accepted path={upstream_path}", flush=True)
             with socket.create_connection((upstream_host, upstream_port), timeout=10) as upstream_socket:
                 upstream_socket.settimeout(None)
                 self.connection.settimeout(None)
@@ -294,15 +300,20 @@ class Handler(BaseHTTPRequestHandler):
 
                 response = read_http_headers(upstream_socket)
                 if not response:
+                    print("WebSocket upstream returned no response", flush=True)
                     self._json(502, {"error": "websocket_upstream_no_response"})
                     return
 
+                status_line = response.split(b"\r\n", 1)[0].decode("utf-8", errors="replace")
+                print(f"WebSocket upstream response: {status_line}", flush=True)
                 self.connection.sendall(response)
                 if not response.startswith(b"HTTP/1.1 101") and not response.startswith(b"HTTP/1.0 101"):
                     return
 
                 tunnel_sockets(self.connection, upstream_socket)
+                print("WebSocket proxy closed", flush=True)
         except Exception as error:
+            print(f"WebSocket proxy error: {error}", flush=True)
             try:
                 self._json(502, {"error": str(error)})
             except Exception:
