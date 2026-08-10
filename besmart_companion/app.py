@@ -15,10 +15,15 @@ PORT = 8765
 DEFAULT_HOME_ASSISTANT_URL = "http://127.0.0.1:8123"
 DEFAULT_COMPANION_URL = "http://127.0.0.1:8765"
 REMOTE_PREFIX = "/remote/ha"
-REMOTE_TOKEN_FILE = "/data/besmart_remote_token"
-HA_UPSTREAM_FILE = "/data/besmart_ha_upstream"
-SERVER_ID_FILE = "/data/besmart_server_id"
+DATA_DIR = os.environ.get("BESMART_DATA_DIR", "/data")
+REMOTE_TOKEN_FILE = os.path.join(DATA_DIR, "besmart_remote_token")
+HA_UPSTREAM_FILE = os.path.join(DATA_DIR, "besmart_ha_upstream")
+SERVER_ID_FILE = os.path.join(DATA_DIR, "besmart_server_id")
+REMOTE_URL_FILE = os.path.join(DATA_DIR, "besmart_remote_url")
+HOME_PROFILE_FILE = os.path.join(DATA_DIR, "besmart_home_profile.json")
 REMOTE_TOKEN_HEADER = "X-BeSmart-Remote-Token"
+HOME_PROFILE_PATH = "/besmart/home-profile"
+MAX_HOME_PROFILE_BYTES = 512 * 1024
 TAILSCALE_CONNECT_LOCK = threading.Lock()
 
 
@@ -43,6 +48,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path.startswith(REMOTE_PREFIX):
             self._proxy_home_assistant()
+            return
+
+        if self.path == HOME_PROFILE_PATH:
+            self._handle_home_profile_get()
             return
 
         if self.path == "/health":
@@ -77,6 +86,20 @@ class Handler(BaseHTTPRequestHandler):
                 "status": status_data,
                 "error": result.stderr or None
             })
+            return
+
+        self._json(404, {"error": "not_found"})
+
+    def do_PUT(self):
+        if self._reject_public_management_request():
+            return
+
+        if self.path == HOME_PROFILE_PATH:
+            self._handle_home_profile_put()
+            return
+
+        if self.path.startswith(REMOTE_PREFIX):
+            self._proxy_home_assistant()
             return
 
         self._json(404, {"error": "not_found"})
@@ -177,12 +200,47 @@ class Handler(BaseHTTPRequestHandler):
     def _reject_public_management_request(self):
         if self.path.startswith(REMOTE_PREFIX):
             return False
+        if self.path == HOME_PROFILE_PATH:
+            return False
 
         if is_public_funnel_host(self.headers.get("Host", "")):
             self._json(404, {"error": "not_found"})
             return True
 
         return False
+
+    def _handle_home_profile_get(self):
+        if not self._is_authorized_companion_request():
+            self._json(401, {"error": "unauthorized"})
+            return
+
+        profile = read_home_profile()
+        if not profile:
+            self._json(404, {"error": "profile_not_found"})
+            return
+
+        self._json(200, profile)
+
+    def _handle_home_profile_put(self):
+        if not self._is_authorized_companion_request():
+            self._json(401, {"error": "unauthorized"})
+            return
+
+        try:
+            profile = self._read_json_body(MAX_HOME_PROFILE_BYTES)
+        except ValueError as error:
+            self._json(400, {"error": str(error)})
+            return
+
+        if not is_valid_home_profile(profile):
+            self._json(400, {"error": "invalid_home_profile"})
+            return
+
+        store_home_profile(profile)
+        self._json(200, {
+            "ok": True,
+            "updated_at": profile.get("updatedAt")
+        })
 
     def _proxy_home_assistant(self):
         stored_token = read_remote_token()
@@ -314,6 +372,28 @@ class Handler(BaseHTTPRequestHandler):
             ""
         ])
         return "\r\n".join(headers).encode("utf-8")
+
+    def _read_json_body(self, max_bytes):
+        length = int(self.headers.get("Content-Length", "0"))
+        if length > max_bytes:
+            raise ValueError("payload_too_large")
+
+        body = self.rfile.read(length) if length > 0 else b"{}"
+        try:
+            return json.loads(body.decode("utf-8") or "{}")
+        except json.JSONDecodeError:
+            raise ValueError("invalid_json")
+
+    def _is_authorized_companion_request(self):
+        stored_token = read_remote_token()
+        if not stored_token:
+            return True
+
+        request_token = self.headers.get(REMOTE_TOKEN_HEADER)
+        if request_token == stored_token:
+            return True
+
+        return is_local_client(self.client_address[0])
 
 
 def normalize_companion_target(value):
@@ -573,19 +653,15 @@ def get_or_create_server_id():
     return value
 
 
-def remote_url_file():
-    return "/data/besmart_remote_url"
-
-
 def store_remote_url(url):
-    os.makedirs(os.path.dirname(remote_url_file()), exist_ok=True)
-    with open(remote_url_file(), "w", encoding="utf-8") as file:
+    os.makedirs(os.path.dirname(REMOTE_URL_FILE), exist_ok=True)
+    with open(REMOTE_URL_FILE, "w", encoding="utf-8") as file:
         file.write(str(url).strip())
 
 
 def read_remote_url():
     try:
-        with open(remote_url_file(), "r", encoding="utf-8") as file:
+        with open(REMOTE_URL_FILE, "r", encoding="utf-8") as file:
             return file.read().strip() or None
     except FileNotFoundError:
         return None
@@ -612,6 +688,57 @@ def read_ha_upstream():
             return value or DEFAULT_HOME_ASSISTANT_URL
     except FileNotFoundError:
         return DEFAULT_HOME_ASSISTANT_URL
+
+
+def store_home_profile(profile):
+    os.makedirs(os.path.dirname(HOME_PROFILE_FILE), exist_ok=True)
+    temporary_file = f"{HOME_PROFILE_FILE}.tmp"
+    with open(temporary_file, "w", encoding="utf-8") as file:
+        json.dump(profile, file, separators=(",", ":"))
+    os.replace(temporary_file, HOME_PROFILE_FILE)
+
+
+def read_home_profile():
+    try:
+        with open(HOME_PROFILE_FILE, "r", encoding="utf-8") as file:
+            return json.load(file)
+    except FileNotFoundError:
+        return None
+    except json.JSONDecodeError:
+        return None
+
+
+def is_valid_home_profile(profile):
+    if not isinstance(profile, dict):
+        return False
+    if profile.get("schemaVersion") != 1:
+        return False
+    return isinstance(profile.get("values"), dict)
+
+
+def is_local_client(address):
+    return (
+        address == "127.0.0.1" or
+        address == "::1" or
+        address.startswith("10.") or
+        address.startswith("192.168.") or
+        address.startswith("172.16.") or
+        address.startswith("172.17.") or
+        address.startswith("172.18.") or
+        address.startswith("172.19.") or
+        address.startswith("172.20.") or
+        address.startswith("172.21.") or
+        address.startswith("172.22.") or
+        address.startswith("172.23.") or
+        address.startswith("172.24.") or
+        address.startswith("172.25.") or
+        address.startswith("172.26.") or
+        address.startswith("172.27.") or
+        address.startswith("172.28.") or
+        address.startswith("172.29.") or
+        address.startswith("172.30.") or
+        address.startswith("172.31.")
+    )
 
 
 def tailscale_dns_url():
