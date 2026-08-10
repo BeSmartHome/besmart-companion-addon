@@ -105,6 +105,7 @@ class Handler(BaseHTTPRequestHandler):
             serve_target_url = normalize_companion_target(data.get("serve_target_url"))
             ha_upstream_url = normalize_ha_upstream(data.get("ha_upstream_url"))
             remote_token = data.get("remote_token")
+            rotate_remote_token = bool(data.get("rotate_remote_token", False))
             expected_url = data.get("expected_url")
 
             if not auth_key:
@@ -139,7 +140,7 @@ class Handler(BaseHTTPRequestHandler):
                 funnel_url = None
 
                 if enable_funnel:
-                    effective_remote_token = read_remote_token() or remote_token
+                    effective_remote_token = remote_token if rotate_remote_token else (read_remote_token() or remote_token)
                     store_server_id(server_id)
                     store_remote_token(effective_remote_token)
                     store_ha_upstream(ha_upstream_url)
@@ -161,6 +162,7 @@ class Handler(BaseHTTPRequestHandler):
                     "server_id": server_id,
                     "url": funnel_url or (f"http://{ip}:8123" if ip else None),
                     "remote_token": read_remote_token(),
+                    "remote_token_rotated": rotate_remote_token,
                     "remote_ready": False if funnel_url else None,
                     "remote_ready_reason": "public_https_must_be_tested_by_client" if funnel_url else None,
                     "serve_target_url": serve_target_url if enable_funnel else None,
