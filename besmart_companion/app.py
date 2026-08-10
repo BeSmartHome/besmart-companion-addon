@@ -38,6 +38,9 @@ class Handler(BaseHTTPRequestHandler):
         print(f"{self.client_address[0]} - {format % args}")
 
     def do_GET(self):
+        if self._reject_public_management_request():
+            return
+
         if self.path.startswith(REMOTE_PREFIX):
             self._proxy_home_assistant()
             return
@@ -79,6 +82,9 @@ class Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not_found"})
 
     def do_POST(self):
+        if self._reject_public_management_request():
+            return
+
         if self.path.startswith(REMOTE_PREFIX):
             self._proxy_home_assistant()
             return
@@ -165,6 +171,16 @@ class Handler(BaseHTTPRequestHandler):
                 TAILSCALE_CONNECT_LOCK.release()
 
         self._json(404, {"error": "not_found"})
+
+    def _reject_public_management_request(self):
+        if self.path.startswith(REMOTE_PREFIX):
+            return False
+
+        if is_public_funnel_host(self.headers.get("Host", "")):
+            self._json(404, {"error": "not_found"})
+            return True
+
+        return False
 
     def _proxy_home_assistant(self):
         stored_token = read_remote_token()
@@ -349,6 +365,11 @@ def is_websocket_upgrade(headers):
     connection = headers.get("Connection", "")
     upgrade = headers.get("Upgrade", "")
     return "upgrade" in connection.lower() and upgrade.lower() == "websocket"
+
+
+def is_public_funnel_host(host):
+    hostname = str(host or "").split(":", 1)[0].strip().lower().rstrip(".")
+    return hostname.endswith(".ts.net")
 
 
 def read_http_headers(source_socket):
