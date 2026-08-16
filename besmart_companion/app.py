@@ -119,6 +119,66 @@ class Handler(BaseHTTPRequestHandler):
 
         self._json(404, {"error": "not_found"})
 
+    def do_PATCH(self):
+        if self._reject_public_management_request():
+            return
+
+        if self.path.startswith(SIGNED_REMOTE_PREFIX):
+            self._proxy_signed_home_assistant()
+            return
+
+        if self.path.startswith(REMOTE_PREFIX):
+            self._proxy_home_assistant()
+            return
+
+        self._json(404, {"error": "not_found"})
+
+    def do_DELETE(self):
+        if self._reject_public_management_request():
+            return
+
+        if self.path.startswith(SIGNED_REMOTE_PREFIX):
+            self._proxy_signed_home_assistant()
+            return
+
+        if self.path.startswith(REMOTE_PREFIX):
+            self._proxy_home_assistant()
+            return
+
+        self._json(404, {"error": "not_found"})
+
+    def do_HEAD(self):
+        if self._reject_public_management_request():
+            return
+
+        if self.path.startswith(SIGNED_REMOTE_PREFIX):
+            self._proxy_signed_home_assistant()
+            return
+
+        if self.path.startswith(REMOTE_PREFIX):
+            self._proxy_home_assistant()
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def do_OPTIONS(self):
+        if self._reject_public_management_request():
+            return
+
+        if self.path.startswith(SIGNED_REMOTE_PREFIX):
+            self._proxy_signed_home_assistant()
+            return
+
+        if self.path.startswith(REMOTE_PREFIX):
+            self._proxy_home_assistant()
+            return
+
+        self.send_response(204)
+        self.send_header("Allow", "GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_POST(self):
         if self._reject_public_management_request():
             return
@@ -309,15 +369,20 @@ class Handler(BaseHTTPRequestHandler):
         if query:
             target_url = f"{target_url}?{query}"
         body = None
-        if self.command in ("POST", "PUT", "PATCH"):
+        if self.command in ("POST", "PUT", "PATCH", "DELETE"):
             length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(length) if length > 0 else None
 
         headers = {}
-        for header in ("Authorization", "Content-Type", "Accept"):
+        for header in ("Authorization", "Content-Type", "Accept", "User-Agent"):
             value = self.headers.get(header)
             if value:
                 headers[header] = value
+
+        print(
+            f"[REMOTE-HTTP] method={self.command} route=ha upstreamPath={sanitize_ha_path_for_log(ha_path)}",
+            flush=True
+        )
 
         request = urllib.request.Request(
             target_url,
@@ -333,14 +398,24 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", response.headers.get("Content-Type", "application/json"))
                 self.send_header("Content-Length", str(len(response_body)))
                 self.end_headers()
-                self.wfile.write(response_body)
+                if self.command != "HEAD":
+                    self.wfile.write(response_body)
+                print(
+                    f"[REMOTE-HTTP] method={self.command} upstreamStatus={response.status} upstreamPath={sanitize_ha_path_for_log(ha_path)}",
+                    flush=True
+                )
         except urllib.error.HTTPError as error:
             response_body = error.read()
             self.send_response(error.code)
             self.send_header("Content-Type", error.headers.get("Content-Type", "application/json"))
             self.send_header("Content-Length", str(len(response_body)))
             self.end_headers()
-            self.wfile.write(response_body)
+            if self.command != "HEAD":
+                self.wfile.write(response_body)
+            print(
+                f"[REMOTE-HTTP] method={self.command} upstreamStatus={error.code} upstreamPath={sanitize_ha_path_for_log(ha_path)}",
+                flush=True
+            )
         except BrokenPipeError:
             print(f"Client disconnected while proxying {ha_path}", flush=True)
         except Exception as error:
@@ -475,11 +550,17 @@ def normalize_ha_upstream(value):
 def is_allowed_ha_path(path):
     allowed_exact = {
         "/api/",
+        "/api/config",
         "/api/states",
+        "/api/services",
         "/api/websocket",
         "/api/config/energy"
     }
     allowed_prefixes = (
+        "/api/config/automation/config/",
+        "/api/config/config_entries",
+        "/api/hassio/",
+        "/api/history/period/",
         "/api/states/",
         "/api/services/"
     )
@@ -529,6 +610,10 @@ def sanitize_signed_path(path):
         "/remote/signed/<expires>/<nonce>/<signature>/ha\\4",
         path
     )
+
+
+def sanitize_ha_path_for_log(path):
+    return re.sub(r"/[A-Za-z0-9_-]{12,}", "/<id>", path)
 
 
 def is_websocket_upgrade(headers):
