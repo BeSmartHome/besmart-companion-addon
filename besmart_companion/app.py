@@ -1,6 +1,10 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import base64
+import hashlib
+import hmac
 import json
 import os
+import re
 import select
 import socket
 import subprocess
@@ -11,10 +15,13 @@ import urllib.error
 import urllib.request
 from urllib.parse import urlparse
 
-PORT = 8765
+PORT = int(os.environ.get("BESMART_COMPANION_PORT", "8765"))
 DEFAULT_HOME_ASSISTANT_URL = "http://127.0.0.1:8123"
 DEFAULT_COMPANION_URL = "http://127.0.0.1:8765"
 REMOTE_PREFIX = "/remote/ha"
+SIGNED_REMOTE_PREFIX = "/remote/signed"
+SIGNED_REMOTE_PATTERN = re.compile(r"^/remote/signed/([0-9]{10,})/([A-Za-z0-9_-]{16,})/([A-Za-z0-9_-]{20,})/ha(/.*)?$")
+SIGNED_ROUTE_MAX_TTL_SECONDS = 300
 DATA_DIR = os.environ.get("BESMART_DATA_DIR", "/data")
 REMOTE_TOKEN_FILE = os.path.join(DATA_DIR, "besmart_remote_token")
 HA_UPSTREAM_FILE = os.path.join(DATA_DIR, "besmart_ha_upstream")
@@ -44,6 +51,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self._reject_public_management_request():
+            return
+
+        if self.path.startswith(SIGNED_REMOTE_PREFIX):
+            self._proxy_signed_home_assistant()
             return
 
         if self.path.startswith(REMOTE_PREFIX):
@@ -94,6 +105,10 @@ class Handler(BaseHTTPRequestHandler):
         if self._reject_public_management_request():
             return
 
+        if self.path.startswith(SIGNED_REMOTE_PREFIX):
+            self._proxy_signed_home_assistant()
+            return
+
         if self.path == HOME_PROFILE_PATH:
             self._handle_home_profile_put()
             return
@@ -106,6 +121,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self._reject_public_management_request():
+            return
+
+        if self.path.startswith(SIGNED_REMOTE_PREFIX):
+            self._proxy_signed_home_assistant()
             return
 
         if self.path.startswith(REMOTE_PREFIX):
@@ -200,6 +219,8 @@ class Handler(BaseHTTPRequestHandler):
     def _reject_public_management_request(self):
         if self.path.startswith(REMOTE_PREFIX):
             return False
+        if self.path.startswith(SIGNED_REMOTE_PREFIX):
+            return False
         if self.path == HOME_PROFILE_PATH:
             return False
 
@@ -255,13 +276,38 @@ class Handler(BaseHTTPRequestHandler):
             self._json(403, {"error": "forbidden"})
             return
 
+        self._proxy_home_assistant_path(ha_path, parsed_remote_path.query)
+
+    def _proxy_signed_home_assistant(self):
+        parsed_remote_path = urlparse(self.path)
+        signed_route = validate_signed_remote_route(parsed_remote_path.path)
+        if not signed_route.get("ok"):
+            print(f"[REMOTE-HTTP] signedRouteRejected reason={signed_route.get('error')}", flush=True)
+            self._json(signed_route.get("status", 401), {"error": signed_route.get("error", "unauthorized")})
+            return
+
+        ha_path = signed_route["ha_path"]
+        if not is_allowed_ha_path(ha_path):
+            self._json(403, {"error": "forbidden"})
+            return
+
         if is_websocket_upgrade(self.headers):
-            self._proxy_home_assistant_websocket(ha_path, parsed_remote_path.query)
+            print(f"[REMOTE-WS] upgradePath={sanitize_signed_path(parsed_remote_path.path)}", flush=True)
+            print("[REMOTE-WS] signatureValid=true", flush=True)
+            print(f"[REMOTE-WS] upstreamPath={ha_path}", flush=True)
+        else:
+            print(f"[REMOTE-HTTP] signedRouteAccepted upstreamPath={ha_path}", flush=True)
+
+        self._proxy_home_assistant_path(ha_path, parsed_remote_path.query)
+
+    def _proxy_home_assistant_path(self, ha_path, query):
+        if is_websocket_upgrade(self.headers):
+            self._proxy_home_assistant_websocket(ha_path, query)
             return
 
         target_url = f"{read_ha_upstream()}{ha_path}"
-        if parsed_remote_path.query:
-            target_url = f"{target_url}?{parsed_remote_path.query}"
+        if query:
+            target_url = f"{target_url}?{query}"
         body = None
         if self.command in ("POST", "PUT", "PATCH"):
             length = int(self.headers.get("Content-Length", "0"))
@@ -312,7 +358,7 @@ class Handler(BaseHTTPRequestHandler):
             upstream_path = f"{upstream_path}?{query}"
 
         try:
-            print(f"WebSocket proxy accepted path={upstream_path}", flush=True)
+            print(f"[REMOTE-WS] proxy upstreamPath={ha_path}", flush=True)
             with socket.create_connection((upstream_host, upstream_port), timeout=10) as upstream_socket:
                 upstream_socket.settimeout(None)
                 self.connection.settimeout(None)
@@ -330,6 +376,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not response.startswith(b"HTTP/1.1 101") and not response.startswith(b"HTTP/1.0 101"):
                     return
 
+                print("[REMOTE-WS] upgradeAccepted", flush=True)
                 tunnel_sockets(self.connection, upstream_socket)
                 print("WebSocket proxy closed", flush=True)
         except Exception as error:
@@ -441,6 +488,47 @@ def is_allowed_ha_path(path):
         return True
 
     return any(path.startswith(prefix) for prefix in allowed_prefixes)
+
+
+def validate_signed_remote_route(path):
+    match = SIGNED_REMOTE_PATTERN.match(path)
+    if not match:
+        return {"ok": False, "status": 404, "error": "signed_route_not_found"}
+
+    stored_token = read_remote_token()
+    if not stored_token:
+        return {"ok": False, "status": 401, "error": "remote_token_missing"}
+
+    expires_raw, nonce, signature, ha_path = match.groups()
+    try:
+        expires_at = int(expires_raw)
+    except ValueError:
+        return {"ok": False, "status": 401, "error": "invalid_expiry"}
+
+    now = int(time.time())
+    if expires_at < now:
+        return {"ok": False, "status": 401, "error": "signed_route_expired"}
+
+    if expires_at - now > SIGNED_ROUTE_MAX_TTL_SECONDS:
+        return {"ok": False, "status": 401, "error": "signed_route_ttl_too_long"}
+
+    signature_input = f"{expires_at}.{nonce}".encode("utf-8")
+    digest = hmac.new(stored_token.encode("utf-8"), signature_input, hashlib.sha256).digest()
+    expected_signature = base64.urlsafe_b64encode(digest).decode("utf-8").rstrip("=")
+    if not hmac.compare_digest(signature, expected_signature):
+        return {"ok": False, "status": 401, "error": "invalid_signature"}
+
+    return {
+        "ok": True,
+        "ha_path": ha_path or "/"
+    }
+
+
+def sanitize_signed_path(path):
+    return SIGNED_REMOTE_PATTERN.sub(
+        "/remote/signed/<expires>/<nonce>/<signature>/ha\\4",
+        path
+    )
 
 
 def is_websocket_upgrade(headers):
