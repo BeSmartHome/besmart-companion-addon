@@ -48,12 +48,12 @@ jobs:
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Publishing version ${VERSION}"
 
-      - name: Build and push aarch64 image
+      - name: Build and push multi-arch image
         uses: docker/build-push-action@v6
         with:
           context: ./besmart_companion
           file: ./besmart_companion/Dockerfile
-          platforms: linux/arm64
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
