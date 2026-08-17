@@ -5,6 +5,7 @@ version: "1.0.5"
 
 arch:
   - aarch64
+  - amd64
 
 image: "ghcr.io/besmarthome/besmart-companion"
 
