@@ -332,8 +332,14 @@ class Handler(BaseHTTPRequestHandler):
 
         parsed_remote_path = urlparse(self.path)
         ha_path = parsed_remote_path.path[len(REMOTE_PREFIX):] or "/"
-        if not is_allowed_ha_path(ha_path):
-            self._json(403, {"error": "forbidden"})
+
+        is_oauth_token_refresh = (
+            ha_path == "/auth/token"
+            and self.command == "POST"
+        )
+
+        if not is_allowed_ha_path(ha_path) and not is_oauth_token_refresh:
+            self._json(403, {"error": "route_not_allowed"})
             return
 
         self._proxy_home_assistant_path(ha_path, parsed_remote_path.query)
