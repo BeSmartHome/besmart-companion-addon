@@ -1,0 +1,311 @@
+import json
+import os
+import tempfile
+import threading
+import time
+import unittest
+from http.client import HTTPConnection
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+
+from cryptography.hazmat.primitives.asymmetric import ed25519
+from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat, PublicFormat, load_der_public_key
+from cryptography.exceptions import InvalidSignature
+
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "besmart_companion"))
+import app
+
+
+class CompanionP03Tests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.data_dir = self.tmp.name
+        self._patch_paths(self.data_dir)
+        self._patch_tailscale()
+        os.environ.pop("BESMART_BACKEND_SIGNING_PUBLIC_KEY", None)
+
+    def tearDown(self):
+        os.environ.pop("BESMART_BACKEND_SIGNING_PUBLIC_KEY", None)
+        self.tmp.cleanup()
+
+    def test_legacy_state_is_preserved_by_identity_creation(self):
+        Path(app.REMOTE_TOKEN_FILE).write_text("existing-token", encoding="utf-8")
+        Path(app.SERVER_ID_FILE).write_text("srv_existing", encoding="utf-8")
+        Path(app.REMOTE_URL_FILE).write_text("https://existing.example/remote/ha", encoding="utf-8")
+
+        identity = app.ensure_companion_identity()
+
+        self.assertEqual(Path(app.REMOTE_TOKEN_FILE).read_text(encoding="utf-8"), "existing-token")
+        self.assertEqual(Path(app.SERVER_ID_FILE).read_text(encoding="utf-8"), "srv_existing")
+        self.assertEqual(Path(app.REMOTE_URL_FILE).read_text(encoding="utf-8"), "https://existing.example/remote/ha")
+        self.assertIn("companion_id", identity)
+
+    def test_identity_persists_and_private_keys_are_not_returned(self):
+        with self._server() as base_url:
+            first = self._request_json("GET", base_url, "/identity")
+            second = self._request_json("GET", base_url, "/identity")
+
+        self.assertEqual(first[0], 200)
+        self.assertEqual(first[1]["companion_id"], second[1]["companion_id"])
+        self.assertIn("signing_public_key", first[1])
+        self.assertIn("encryption_public_key", first[1])
+        self.assertNotIn("signing_private_key", first[1])
+        self.assertNotIn("encryption_private_key", first[1])
+
+    def test_pairing_consume_hashes_secret_signs_receipt_and_rejects_replay(self):
+        identity = app.ensure_companion_identity()
+        self._write_options({
+            "remote_pairing": {
+                "protocol_version": 1,
+                "pairing_id": "pairing-1",
+                "pairing_secret": "pairing-secret",
+                "backend_challenge_id": "challenge-1",
+                "backend_nonce_hash": "nonce-hash",
+                "app_attest_key_id": "app-attest-1",
+                "companion_id": identity["companion_id"],
+                "expires_at": app.iso_from_now(120)
+            }
+        })
+
+        with self._server() as base_url:
+            wrong_key_status, _ = self._request_json("POST", base_url, "/pairing/consume", {
+                "protocol_version": 1,
+                "pairing_id": "pairing-1",
+                "backend_challenge_id": "challenge-1",
+                "app_attest_key_id": "wrong-app-attest"
+            })
+            status, receipt = self._request_json("POST", base_url, "/pairing/consume", {
+                "protocol_version": 1,
+                "pairing_id": "pairing-1",
+                "backend_challenge_id": "challenge-1",
+                "app_attest_key_id": "app-attest-1"
+            })
+            replay_status, _ = self._request_json("POST", base_url, "/pairing/consume", {
+                "protocol_version": 1,
+                "pairing_id": "pairing-1",
+                "backend_challenge_id": "challenge-1",
+                "app_attest_key_id": "app-attest-1"
+            })
+
+        self.assertEqual(wrong_key_status, 401)
+        self.assertEqual(status, 200)
+        public_key = load_der_public_key(app.base64url_decode(identity["signing_public_key"]))
+        try:
+            public_key.verify(
+                app.base64url_decode(receipt["signature"]),
+                app.canonical_bytes(app.receipt_canonical_payload(receipt))
+            )
+        except InvalidSignature:
+            self.fail("receipt signature was invalid")
+
+        pairings = json.loads(Path(app.PAIRINGS_FILE).read_text(encoding="utf-8"))
+        self.assertNotIn("pairing_secret", pairings["pairing-1"])
+        self.assertEqual(pairings["pairing-1"]["status"], "consumed")
+        self.assertEqual(replay_status, 404)
+
+    def test_expired_pairing_is_rejected(self):
+        identity = app.ensure_companion_identity()
+        self._write_options({
+            "remote_pairing": {
+                "protocol_version": 1,
+                "pairing_id": "pairing-expired",
+                "pairing_secret": "pairing-secret",
+                "backend_challenge_id": "challenge-1",
+                "backend_nonce_hash": "nonce-hash",
+                "app_attest_key_id": "app-attest-1",
+                "companion_id": identity["companion_id"],
+                "expires_at": "2020-01-01T00:00:00Z"
+            }
+        })
+
+        with self._server() as base_url:
+            status, body = self._request_json("POST", base_url, "/pairing/consume", {
+                "protocol_version": 1,
+                "pairing_id": "pairing-expired",
+                "backend_challenge_id": "challenge-1",
+                "app_attest_key_id": "app-attest-1"
+            })
+
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"], "pairing_not_found")
+
+    def test_secure_connect_rejects_raw_auth_key_for_p0_3(self):
+        with self._server() as base_url:
+            status, body = self._request_json("POST", base_url, "/tailscale/connect", {
+                "protocol_version": 1,
+                "auth_key": "tskey-raw"
+            })
+
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "raw_auth_key_rejected")
+
+    def test_secure_connect_rejects_bad_signature_wrong_audience_and_replay(self):
+        backend_private = ed25519.Ed25519PrivateKey.generate()
+        backend_public = backend_private.public_key()
+        os.environ["BESMART_BACKEND_SIGNING_PUBLIC_KEY"] = app.base64url_encode(
+            backend_public.public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+        )
+
+        identity = app.ensure_companion_identity()
+        app.store_server_id("srv_secure")
+        valid_package = self._make_setup_package(identity, backend_private, "srv_secure")
+        reused_connect = self._make_setup_package(identity, backend_private, "srv_secure", package_id="pkg-2", connect_id="connect-1")
+
+        tampered = dict(valid_package)
+        tampered["server_id"] = "srv_tampered"
+
+        wrong_identity = dict(identity)
+        wrong_identity["companion_id"] = "wrong-companion"
+        wrong_audience = self._make_setup_package(wrong_identity, backend_private, "srv_secure")
+
+        with self._server() as base_url:
+            tampered_status, _ = self._request_json("POST", base_url, "/tailscale/connect", {
+                "protocol_version": 1,
+                "setup_package": tampered
+            })
+            audience_status, _ = self._request_json("POST", base_url, "/tailscale/connect", {
+                "protocol_version": 1,
+                "setup_package": wrong_audience
+            })
+            first_status, first_body = self._request_json("POST", base_url, "/tailscale/connect", {
+                "protocol_version": 1,
+                "setup_package": valid_package
+            })
+            replay_status, _ = self._request_json("POST", base_url, "/tailscale/connect", {
+                "protocol_version": 1,
+                "setup_package": valid_package
+            })
+            connect_replay_status, _ = self._request_json("POST", base_url, "/tailscale/connect", {
+                "protocol_version": 1,
+                "setup_package": reused_connect
+            })
+
+        self.assertEqual(tampered_status, 401)
+        self.assertEqual(audience_status, 401)
+        self.assertEqual(first_status, 200)
+        self.assertNotIn("remote_token", first_body)
+        self.assertNotIn("tailscale_auth_key", first_body)
+        self.assertEqual(Path(app.REMOTE_TOKEN_FILE).read_text(encoding="utf-8"), "secure-token")
+        self.assertEqual(replay_status, 409)
+        self.assertEqual(connect_replay_status, 409)
+
+    def test_existing_remote_token_proxy_behavior_unchanged(self):
+        Path(app.REMOTE_TOKEN_FILE).write_text("expected-token", encoding="utf-8")
+        with self._server() as base_url:
+            unauthorized, _ = self._request_json("GET", base_url, "/remote/ha/api/states")
+            authorized, body = self._request_json(
+                "GET",
+                base_url,
+                "/remote/ha/api/states",
+                headers={"X-BeSmart-Remote-Token": "expected-token"}
+            )
+
+        self.assertEqual(unauthorized, 401)
+        self.assertIn(authorized, (200, 502))
+        if authorized == 200:
+            self.assertIsInstance(body, dict)
+
+    def _patch_paths(self, data_dir):
+        app.DATA_DIR = data_dir
+        app.REMOTE_TOKEN_FILE = os.path.join(data_dir, "besmart_remote_token")
+        app.HA_UPSTREAM_FILE = os.path.join(data_dir, "besmart_ha_upstream")
+        app.SERVER_ID_FILE = os.path.join(data_dir, "besmart_server_id")
+        app.REMOTE_URL_FILE = os.path.join(data_dir, "besmart_remote_url")
+        app.HOME_PROFILE_FILE = os.path.join(data_dir, "besmart_home_profile.json")
+        app.ADDON_OPTIONS_FILE = os.path.join(data_dir, "options.json")
+        app.COMPANION_IDENTITY_FILE = os.path.join(data_dir, "besmart_companion_identity.json")
+        app.PAIRINGS_FILE = os.path.join(data_dir, "besmart_pairings.json")
+        app.CONSUMED_PACKAGES_FILE = os.path.join(data_dir, "besmart_consumed_setup_packages.json")
+
+    def _patch_tailscale(self):
+        app.read_tailscale_status = lambda: {"BackendState": "Running", "Self": {"DNSName": "besmart-home.example.ts.net."}}
+        app.read_tailscale_ip = lambda: "100.64.0.1"
+        app.run_tailscale_up = lambda auth_key, hostname, enable_funnel: {"ok": True}
+        app.enable_tailscale_funnel = lambda target: {"ok": True}
+
+    def _write_options(self, value):
+        Path(app.ADDON_OPTIONS_FILE).write_text(json.dumps(value), encoding="utf-8")
+
+    def _make_setup_package(self, identity, backend_private_key, server_id, package_id="pkg-1", connect_id="connect-1"):
+        suite = app.hpke_suite()
+        recipient = suite.kem.deserialize_public_key(app.base64url_decode(identity["encryption_public_key"]))
+        aad = app.canonicalize({
+            "protocol_version": 1,
+            "package_id": package_id,
+            "companion_id": identity["companion_id"],
+            "server_id": server_id
+        })
+        plaintext = {
+            "protocol_version": 1,
+            "connect_id": connect_id,
+            "server_id": server_id,
+            "hostname": "besmart-home",
+            "tailscale_auth_key": "tskey-secure",
+            "tailscale_auth_key_reusable": False,
+            "tailscale_auth_key_preauthorized": True,
+            "tailscale_auth_key_expires_at": app.iso_from_now(600),
+            "remote_token": "secure-token",
+            "serve_target_url": "http://127.0.0.1:8765",
+            "ha_upstream_url": "http://127.0.0.1:8123",
+            "expected_url": "https://besmart-home.example.ts.net/remote/ha",
+            "issued_at": app.iso_now(),
+            "expires_at": app.iso_from_now(600)
+        }
+        enc, context = suite.create_sender_context(
+            recipient,
+            info=app.SETUP_PACKAGE_INFO
+        )
+        ciphertext = context.seal(
+            json.dumps(plaintext, separators=(",", ":")).encode("utf-8"),
+            aad=aad.encode("utf-8")
+        )
+        envelope = {
+            "protocol_version": 1,
+            "package_id": package_id,
+            "companion_id": identity["companion_id"],
+            "server_id": server_id,
+            "issued_at": app.iso_now(),
+            "expires_at": app.iso_from_now(600),
+            "encryption_alg": app.SETUP_PACKAGE_ENCRYPTION_ALG,
+            "signature_alg": app.SETUP_PACKAGE_SIGNATURE_ALG,
+            "encapsulated_key": app.base64url_encode(enc),
+            "ciphertext": app.base64url_encode(ciphertext),
+            "aad": aad,
+            "backend_signature": ""
+        }
+        envelope["backend_signature"] = app.base64url_encode(
+            backend_private_key.sign(app.canonical_bytes(app.envelope_canonical_payload(envelope)))
+        )
+        return envelope
+
+    class _server:
+        def __init__(self_outer):
+            self_outer.server = ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+            self_outer.thread = threading.Thread(target=self_outer.server.serve_forever, daemon=True)
+
+        def __enter__(self_outer):
+            self_outer.thread.start()
+            host, port = self_outer.server.server_address
+            return f"{host}:{port}"
+
+        def __exit__(self_outer, exc_type, exc, tb):
+            self_outer.server.shutdown()
+            self_outer.thread.join(timeout=2)
+
+    def _request_json(self, method, base_url, path, body=None, headers=None):
+        host, port = base_url.split(":")
+        conn = HTTPConnection(host, int(port), timeout=5)
+        payload = json.dumps(body).encode("utf-8") if body is not None else None
+        request_headers = {"Content-Type": "application/json"}
+        if headers:
+            request_headers.update(headers)
+        conn.request(method, path, body=payload, headers=request_headers)
+        response = conn.getresponse()
+        raw = response.read()
+        conn.close()
+        return response.status, json.loads(raw.decode("utf-8") or "{}")
+
+
+if __name__ == "__main__":
+    unittest.main()

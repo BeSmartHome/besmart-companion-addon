@@ -13,7 +13,20 @@ import time
 import uuid
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from urllib.parse import urlparse
+
+from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
+from cryptography.hazmat.primitives.serialization import (
+    Encoding,
+    NoEncryption,
+    PrivateFormat,
+    PublicFormat,
+    load_der_private_key,
+    load_der_public_key,
+)
+from cryptography.exceptions import InvalidSignature
+from pyhpke import AEADId, CipherSuite, KDFId, KEMId
 
 PORT = int(os.environ.get("BESMART_COMPANION_PORT", "8765"))
 DEFAULT_HOME_ASSISTANT_URL = "http://127.0.0.1:8123"
@@ -28,10 +41,18 @@ HA_UPSTREAM_FILE = os.path.join(DATA_DIR, "besmart_ha_upstream")
 SERVER_ID_FILE = os.path.join(DATA_DIR, "besmart_server_id")
 REMOTE_URL_FILE = os.path.join(DATA_DIR, "besmart_remote_url")
 HOME_PROFILE_FILE = os.path.join(DATA_DIR, "besmart_home_profile.json")
+ADDON_OPTIONS_FILE = os.path.join(DATA_DIR, "options.json")
+COMPANION_IDENTITY_FILE = os.path.join(DATA_DIR, "besmart_companion_identity.json")
+PAIRINGS_FILE = os.path.join(DATA_DIR, "besmart_pairings.json")
+CONSUMED_PACKAGES_FILE = os.path.join(DATA_DIR, "besmart_consumed_setup_packages.json")
 REMOTE_TOKEN_HEADER = "X-BeSmart-Remote-Token"
 HOME_PROFILE_PATH = "/besmart/home-profile"
 MAX_HOME_PROFILE_BYTES = 512 * 1024
 TAILSCALE_CONNECT_LOCK = threading.Lock()
+PAIRING_TTL_SECONDS = 120
+SETUP_PACKAGE_INFO = b"besmart-sosync-remote-setup-package-v1"
+SETUP_PACKAGE_ENCRYPTION_ALG = "HPKE-X25519-HKDF-SHA256-CHACHA20-POLY1305"
+SETUP_PACKAGE_SIGNATURE_ALG = "Ed25519"
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -73,7 +94,15 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/identity":
+            identity = ensure_companion_identity()
             self._json(200, {
+                "protocol_version": 1,
+                "companion_id": identity["companion_id"],
+                "companion_instance_id": identity["companion_instance_id"],
+                "signing_public_key": identity["signing_public_key"],
+                "encryption_public_key": identity["encryption_public_key"],
+                "setup_counter": identity.get("setup_counter", 0),
+                "minimum_protocol_version": 1,
                 "server_id": get_or_create_server_id(),
                 "remote_url": read_remote_url(),
                 "tailscale_dns_name": tailscale_dns_name(read_tailscale_status())
@@ -200,6 +229,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": "invalid_json"})
                 return
 
+            if data.get("protocol_version") == 1 or data.get("setup_package") is not None:
+                self._handle_secure_tailscale_connect(data)
+                return
+
             auth_key = data.get("auth_key")
             server_id = data.get("server_id") or get_or_create_server_id()
             hostname = data.get("hostname", "besmart-home")
@@ -274,7 +307,195 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 TAILSCALE_CONNECT_LOCK.release()
 
+        if self.path == "/pairing/consume":
+            self._handle_pairing_consume()
+            return
+
         self._json(404, {"error": "not_found"})
+
+    def _handle_pairing_consume(self):
+        try:
+            data = self._read_json_body(16 * 1024)
+        except ValueError as error:
+            self._json(400, {"error": str(error)})
+            return
+
+        ingest_remote_pairing_from_supervisor_config()
+        pairings = read_json_file(PAIRINGS_FILE, {})
+        pairing_id = str(data.get("pairing_id") or "")
+        pairing = pairings.get(pairing_id)
+        identity = ensure_companion_identity()
+
+        if not pairing or pairing.get("status") != "pending":
+            self._json(404, {"error": "pairing_not_found"})
+            return
+
+        if is_expired_iso(pairing.get("expires_at")):
+            pairing["status"] = "expired"
+            write_json_file_secure(PAIRINGS_FILE, pairings)
+            self._json(401, {"error": "pairing_expired"})
+            return
+
+        if pairing.get("backend_challenge_id") != data.get("backend_challenge_id"):
+            self._json(401, {"error": "pairing_challenge_mismatch"})
+            return
+
+        if pairing.get("app_attest_key_id") != data.get("app_attest_key_id"):
+            self._json(401, {"error": "pairing_app_attest_key_mismatch"})
+            return
+
+        if pairing.get("companion_id") != identity.get("companion_id"):
+            self._json(401, {"error": "pairing_companion_mismatch"})
+            return
+
+        now = iso_now()
+        pairing["status"] = "consumed"
+        pairing["consumed_at"] = now
+        write_json_file_secure(PAIRINGS_FILE, pairings)
+
+        receipt = {
+            "protocol_version": 1,
+            "pairing_id": pairing["pairing_id"],
+            "backend_challenge_id": pairing["backend_challenge_id"],
+            "companion_id": identity["companion_id"],
+            "companion_instance_id": identity["companion_instance_id"],
+            "setup_counter": identity.get("setup_counter", 0),
+            "issued_at": now,
+            "expires_at": iso_from_now(PAIRING_TTL_SECONDS),
+            "pairing_secret_hash": pairing["pairing_secret_hash"],
+            "app_attest_key_id": pairing["app_attest_key_id"],
+            "backend_nonce_hash": pairing["backend_nonce_hash"],
+            "signature": ""
+        }
+        receipt["signature"] = sign_ed25519_base64url(
+            identity["signing_private_key"],
+            canonical_bytes(receipt_canonical_payload(receipt))
+        )
+        self._json(200, receipt)
+
+    def _handle_secure_tailscale_connect(self, data):
+        if data.get("auth_key"):
+            self._json(400, {"ok": False, "error": "raw_auth_key_rejected"})
+            return
+
+        setup_package = data.get("setup_package")
+        if not isinstance(setup_package, dict):
+            self._json(400, {"ok": False, "error": "missing_setup_package"})
+            return
+
+        backend_public_key = read_backend_public_key()
+        if not backend_public_key:
+            self._json(500, {"ok": False, "error": "missing_backend_verification_key"})
+            return
+
+        if not TAILSCALE_CONNECT_LOCK.acquire(blocking=False):
+            self._json(409, {"ok": False, "error": "tailscale_connect_in_progress", "url": read_remote_url()})
+            return
+
+        try:
+            identity = ensure_companion_identity()
+            consumed = read_consumed_packages()
+            package_id = str(setup_package.get("package_id") or "")
+            if not package_id:
+                self._json(400, {"ok": False, "error": "missing_package_id"})
+                return
+            if consumed.get("package_ids", {}).get(package_id):
+                self._json(409, {"ok": False, "error": "setup_package_reused"})
+                return
+
+            if not verify_setup_package_envelope(setup_package, backend_public_key):
+                self._json(401, {"ok": False, "error": "invalid_setup_package_signature"})
+                return
+
+            if setup_package.get("companion_id") != identity.get("companion_id"):
+                self._json(401, {"ok": False, "error": "setup_package_audience_mismatch"})
+                return
+
+            if is_expired_iso(setup_package.get("expires_at")):
+                self._json(401, {"ok": False, "error": "setup_package_expired"})
+                return
+
+            try:
+                plaintext = decrypt_setup_package(setup_package, identity["encryption_private_key"])
+            except Exception:
+                self._json(401, {"ok": False, "error": "setup_package_decryption_failed"})
+                return
+
+            server_id = str(plaintext.get("server_id") or "")
+            current_server_id = get_or_create_server_id()
+            if setup_package.get("server_id") != server_id or (current_server_id and current_server_id != server_id):
+                self._json(401, {"ok": False, "error": "setup_package_server_mismatch"})
+                return
+
+            connect_id = str(plaintext.get("connect_id") or "")
+            if not connect_id:
+                self._json(400, {"ok": False, "error": "missing_connect_id"})
+                return
+            if consumed.get("connect_ids", {}).get(connect_id):
+                self._json(409, {"ok": False, "error": "connect_id_reused"})
+                return
+
+            if is_expired_iso(plaintext.get("expires_at")) or is_expired_iso(plaintext.get("tailscale_auth_key_expires_at")):
+                self._json(401, {"ok": False, "error": "setup_package_payload_expired"})
+                return
+
+            auth_key = str(plaintext.get("tailscale_auth_key") or "")
+            remote_token = str(plaintext.get("remote_token") or "")
+            hostname = sanitize_hostname(plaintext.get("hostname") or "besmart-home")
+            expected_url = str(plaintext.get("expected_url") or "")
+            serve_target_url = normalize_companion_target(plaintext.get("serve_target_url"))
+            ha_upstream_url = normalize_ha_upstream(plaintext.get("ha_upstream_url"))
+
+            if (
+                not auth_key or
+                not remote_token or
+                not hostname or
+                plaintext.get("tailscale_auth_key_reusable") is not False or
+                plaintext.get("tailscale_auth_key_preauthorized") is not True
+            ):
+                self._json(400, {"ok": False, "error": "invalid_setup_package_payload"})
+                return
+
+            current_status = read_tailscale_status()
+            reused_existing_login = tailscale_is_running(current_status)
+            if reused_existing_login:
+                print(f"Reusing existing Tailscale login dns={tailscale_dns_name(current_status)}", flush=True)
+            else:
+                up_result = run_tailscale_up(auth_key, hostname, True)
+                if not up_result.get("ok"):
+                    self._json(up_result.get("status", 500), {"ok": False, "error": up_result.get("error", "tailscale_up_failed")})
+                    return
+
+            ip = read_tailscale_ip()
+            store_server_id(server_id)
+            store_ha_upstream(ha_upstream_url)
+            funnel_target = str(urlparse(serve_target_url).port or PORT)
+            funnel_result = enable_tailscale_funnel(funnel_target)
+            if not funnel_result.get("ok"):
+                self._json(funnel_result.get("status", 500), {"ok": False, "error": funnel_result.get("error", "failed_to_enable_funnel")})
+                return
+
+            funnel_url = tailscale_dns_url() or expected_url or read_remote_url()
+            if funnel_url:
+                store_remote_url(funnel_url)
+                print(f"Tailscale Funnel configured url={funnel_url}", flush=True)
+
+            store_remote_token(remote_token)
+            consumed.setdefault("package_ids", {})[package_id] = iso_now()
+            consumed.setdefault("connect_ids", {})[connect_id] = iso_now()
+            write_json_file_secure(CONSUMED_PACKAGES_FILE, consumed)
+            identity["setup_counter"] = int(identity.get("setup_counter") or 0) + 1
+            write_json_file_secure(COMPANION_IDENTITY_FILE, identity)
+
+            self._json(200, {
+                "protocol_version": 1,
+                "status": "registered",
+                "server_id": server_id,
+                "url": funnel_url or (f"http://{ip}:8123" if ip else None),
+                "remote_token_fingerprint": remote_token_fingerprint(remote_token)
+            })
+        finally:
+            TAILSCALE_CONNECT_LOCK.release()
 
     def _reject_public_management_request(self):
         if self.path.startswith(REMOTE_PREFIX):
@@ -854,6 +1075,241 @@ def read_remote_token():
         return None
 
 
+def ensure_companion_identity():
+    identity = read_json_file(COMPANION_IDENTITY_FILE, None)
+    if (
+        isinstance(identity, dict) and
+        identity.get("companion_id") and
+        identity.get("companion_instance_id") and
+        identity.get("signing_public_key") and
+        identity.get("signing_private_key") and
+        identity.get("encryption_public_key") and
+        identity.get("encryption_private_key")
+    ):
+        return identity
+
+    signing_private_key = ed25519.Ed25519PrivateKey.generate()
+    signing_public_key = signing_private_key.public_key()
+    encryption_private_key = x25519.X25519PrivateKey.generate()
+    encryption_public_key = encryption_private_key.public_key()
+
+    identity = {
+        "protocol_version": 1,
+        "companion_id": str(uuid.uuid4()),
+        "companion_instance_id": str(uuid.uuid4()),
+        "signing_public_key": base64url_encode(signing_public_key.public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)),
+        "signing_private_key": base64url_encode(signing_private_key.private_bytes(Encoding.DER, PrivateFormat.PKCS8, NoEncryption())),
+        "encryption_public_key": base64url_encode(encryption_public_key.public_bytes(Encoding.Raw, PublicFormat.Raw)),
+        "encryption_private_key": base64url_encode(encryption_private_key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())),
+        "setup_counter": 0,
+        "minimum_protocol_version": 1,
+        "created_at": iso_now()
+    }
+    write_json_file_secure(COMPANION_IDENTITY_FILE, identity)
+    return identity
+
+
+def ingest_remote_pairing_from_supervisor_config():
+    options = read_json_file(ADDON_OPTIONS_FILE, {})
+    remote_pairing = options.get("remote_pairing") if isinstance(options, dict) else None
+    if not isinstance(remote_pairing, dict):
+        return
+
+    identity = ensure_companion_identity()
+    if remote_pairing.get("companion_id") != identity.get("companion_id") or is_expired_iso(remote_pairing.get("expires_at")):
+        options.pop("remote_pairing", None)
+        write_json_file_secure(ADDON_OPTIONS_FILE, options)
+        return
+
+    pairing_id = str(remote_pairing.get("pairing_id") or "")
+    pairing_secret = str(remote_pairing.get("pairing_secret") or "")
+    if not pairing_id or not pairing_secret:
+        options.pop("remote_pairing", None)
+        write_json_file_secure(ADDON_OPTIONS_FILE, options)
+        return
+
+    pairings = read_json_file(PAIRINGS_FILE, {})
+    if pairing_id not in pairings:
+        pairings[pairing_id] = {
+            "pairing_id": pairing_id,
+            "backend_challenge_id": str(remote_pairing.get("backend_challenge_id") or ""),
+            "backend_nonce_hash": str(remote_pairing.get("backend_nonce_hash") or ""),
+            "app_attest_key_id": str(remote_pairing.get("app_attest_key_id") or ""),
+            "companion_id": str(remote_pairing.get("companion_id") or ""),
+            "pairing_secret_hash": sha256_base64url(pairing_secret.encode("utf-8")),
+            "created_at": iso_now(),
+            "expires_at": str(remote_pairing.get("expires_at") or ""),
+            "status": "pending"
+        }
+        write_json_file_secure(PAIRINGS_FILE, pairings)
+
+    options.pop("remote_pairing", None)
+    write_json_file_secure(ADDON_OPTIONS_FILE, options)
+
+
+def read_consumed_packages():
+    consumed = read_json_file(CONSUMED_PACKAGES_FILE, {})
+    if not isinstance(consumed, dict):
+        consumed = {}
+    consumed.setdefault("package_ids", {})
+    consumed.setdefault("connect_ids", {})
+    return consumed
+
+
+def read_backend_public_key():
+    configured = os.environ.get("BESMART_BACKEND_SIGNING_PUBLIC_KEY", "").strip()
+    if configured:
+        return configured
+
+    options = read_json_file(ADDON_OPTIONS_FILE, {})
+    if isinstance(options, dict):
+        return str(options.get("backend_signing_public_key") or "").strip()
+    return ""
+
+
+def verify_setup_package_envelope(envelope, backend_public_key):
+    if envelope.get("encryption_alg") != SETUP_PACKAGE_ENCRYPTION_ALG:
+        return False
+    if envelope.get("signature_alg") != SETUP_PACKAGE_SIGNATURE_ALG:
+        return False
+    signature = envelope.get("backend_signature")
+    if not signature:
+        return False
+    try:
+        public_key = load_der_public_key(base64url_decode(backend_public_key))
+        public_key.verify(base64url_decode(signature), canonical_bytes(envelope_canonical_payload(envelope)))
+        return True
+    except (InvalidSignature, ValueError, TypeError):
+        return False
+
+
+def decrypt_setup_package(envelope, encryption_private_key):
+    suite = hpke_suite()
+    private_key = suite.kem.deserialize_private_key(base64url_decode(encryption_private_key))
+    context = suite.create_recipient_context(
+        base64url_decode(envelope.get("encapsulated_key") or ""),
+        private_key,
+        info=SETUP_PACKAGE_INFO
+    )
+    plaintext = context.open(
+        base64url_decode(envelope.get("ciphertext") or ""),
+        aad=str(envelope.get("aad") or "").encode("utf-8")
+    )
+    return json.loads(plaintext.decode("utf-8"))
+
+
+def hpke_suite():
+    return CipherSuite.new(
+        KEMId.DHKEM_X25519_HKDF_SHA256,
+        KDFId.HKDF_SHA256,
+        AEADId.CHACHA20_POLY1305
+    )
+
+
+def sign_ed25519_base64url(private_key_base64url, payload):
+    private_key = load_der_private_key(base64url_decode(private_key_base64url), password=None)
+    return base64url_encode(private_key.sign(payload))
+
+
+def canonical_bytes(value):
+    return canonicalize(value).encode("utf-8")
+
+
+def canonicalize(value):
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int) or isinstance(value, float):
+        if isinstance(value, float) and not value.is_integer():
+            return json.dumps(value, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+        return str(int(value))
+    if isinstance(value, str):
+        return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+    if isinstance(value, list):
+        return "[" + ",".join(canonicalize(item) for item in value) + "]"
+    if isinstance(value, dict):
+        items = []
+        for key in sorted(value.keys()):
+            if value[key] is not None:
+                items.append(f"{json.dumps(str(key), separators=(',', ':'), ensure_ascii=False)}:{canonicalize(value[key])}")
+        return "{" + ",".join(items) + "}"
+    raise ValueError("unsupported_json_value")
+
+
+def receipt_canonical_payload(receipt):
+    return {key: value for key, value in receipt.items() if key != "signature"}
+
+
+def envelope_canonical_payload(envelope):
+    return {key: value for key, value in envelope.items() if key != "backend_signature"}
+
+
+def read_json_file(path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            return json.load(file)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+
+def write_json_file_secure(path, payload):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temporary_file = f"{path}.tmp"
+    with open(temporary_file, "w", encoding="utf-8") as file:
+        json.dump(payload, file, separators=(",", ":"))
+    os.chmod(temporary_file, 0o600)
+    os.replace(temporary_file, path)
+    os.chmod(path, 0o600)
+
+
+def base64url_encode(value):
+    return base64.urlsafe_b64encode(value).decode("utf-8").rstrip("=")
+
+
+def base64url_decode(value):
+    normalized = str(value or "").replace("-", "+").replace("_", "/")
+    padding = "=" * ((4 - len(normalized) % 4) % 4)
+    return base64.b64decode(f"{normalized}{padding}")
+
+
+def sha256_base64url(value):
+    return base64url_encode(hashlib.sha256(value).digest())
+
+
+def remote_token_fingerprint(remote_token):
+    return sha256_base64url(str(remote_token).encode("utf-8"))[:16]
+
+
+def iso_now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def iso_from_now(seconds):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + seconds))
+
+
+def is_expired_iso(value):
+    if not value:
+        return True
+    try:
+        timestamp = time.strptime(str(value).replace(".000Z", "Z"), "%Y-%m-%dT%H:%M:%SZ")
+        import calendar
+        return calendar.timegm(timestamp) <= time.time()
+    except ValueError:
+        try:
+            normalized = str(value).replace("Z", "+00:00")
+            return datetime.fromisoformat(normalized).timestamp() <= datetime.now(timezone.utc).timestamp()
+        except Exception:
+            return True
+
+
+def sanitize_hostname(value):
+    hostname = re.sub(r"[^a-zA-Z0-9-]", "-", str(value or "").strip().lower())
+    hostname = re.sub(r"-+", "-", hostname).strip("-")
+    return hostname[:63] or "besmart-home"
+
+
 def store_ha_upstream(url):
     os.makedirs(os.path.dirname(HA_UPSTREAM_FILE), exist_ok=True)
     with open(HA_UPSTREAM_FILE, "w", encoding="utf-8") as file:
@@ -955,6 +1411,7 @@ def tailscale_dns_name(status_data):
     return dns_name or None
 
 
-print(f"BeSmart Companion listening on port {PORT}")
-server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-server.serve_forever()
+if __name__ == "__main__":
+    print(f"BeSmart Companion listening on port {PORT}")
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    server.serve_forever()
