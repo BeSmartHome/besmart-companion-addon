@@ -1261,18 +1261,61 @@ def has_local_e2ee_pairing_authorization(headers):
     options = read_json_file(ADDON_OPTIONS_FILE, {})
     authorization = options.get("e2ee_pairing_authorization") if isinstance(options, dict) else None
     if not isinstance(authorization, dict):
+        print("[SOSYNC-E2EE-COMPANION] pairingAuth configured=false rejectionReason=missingConfig", flush=True)
         return False
 
     expected = str(authorization.get("token") or "").strip()
     expires_at = authorization.get("expires_at")
-    if not expected or is_expired_iso(expires_at):
+    expected_fingerprint = token_fingerprint(expected)
+    received = str(headers.get("X-SoSync-Local-Pairing-Token") or "").strip()
+    received_fingerprint = token_fingerprint(received)
+    expires_parse = parse_iso_epoch(expires_at)
+    now_epoch = int(time.time())
+    expires_epoch = int(expires_parse[1]) if expires_parse[1] is not None else 0
+    expired = bool(expires_parse[0] and expires_epoch <= now_epoch)
+    print(f"[SOSYNC-E2EE] companionRuntimeAuthorization observed={bool(expected)} tokenFingerprint={expected_fingerprint}", flush=True)
+    print(f"[SOSYNC-E2EE-COMPANION] pairingAuth configured=true tokenFingerprint={expected_fingerprint} headerFingerprint={received_fingerprint} expiresAt=present", flush=True)
+    print(f"[SOSYNC-E2EE-COMPANION] pairingAuth expiresParseSuccess={expires_parse[0]} expiresEpoch={expires_epoch} nowEpoch={now_epoch} expired={expired}", flush=True)
+    if not expected:
+        print("[SOSYNC-E2EE-COMPANION] pairingAuth tokenMatch=false expired=false rejectionReason=missingConfig", flush=True)
+        return False
+    if not received:
+        print("[SOSYNC-E2EE-COMPANION] pairingAuth tokenMatch=false expired=false rejectionReason=missingHeader", flush=True)
+        return False
+    if not expires_parse[0]:
+        print("[SOSYNC-E2EE-COMPANION] pairingAuth tokenMatch=false expired=false rejectionReason=invalidExpiry", flush=True)
+        return False
+    if expired:
+        print("[SOSYNC-E2EE-COMPANION] pairingAuth tokenMatch=false expired=true rejectionReason=expired", flush=True)
         return False
 
-    received = str(headers.get("X-SoSync-Local-Pairing-Token") or "").strip()
     authorized = bool(received) and hmac.compare_digest(received, expected)
+    print(f"[SOSYNC-E2EE-COMPANION] pairingAuth tokenMatch={authorized} expired=false rejectionReason={'none' if authorized else 'tokenMismatch'}", flush=True)
     if authorized:
         print("[SOSYNC-E2EE] pairingAuthorization source=supervisorOptions result=available", flush=True)
     return authorized
+
+
+def token_fingerprint(value):
+    candidate = str(value or "").strip()
+    if not candidate:
+        return "none"
+    return hashlib.sha256(candidate.encode("utf-8")).hexdigest()[:12]
+
+
+def parse_iso_epoch(value):
+    try:
+        candidate = str(value or "").strip()
+        if not candidate:
+            return (False, None)
+        if candidate.endswith("Z"):
+            candidate = candidate[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(candidate)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return (True, parsed.timestamp())
+    except Exception:
+        return (False, None)
 
 
 def clear_e2ee_pairing_authorization():

@@ -100,6 +100,28 @@ class CompanionP03Tests(unittest.TestCase):
         options = json.loads(Path(app.ADDON_OPTIONS_FILE).read_text(encoding="utf-8"))
         self.assertNotIn("e2ee_pairing_authorization", options)
 
+    def test_e2ee_pair_authorization_rejects_expired_token(self):
+        device_private = x25519.X25519PrivateKey.generate()
+        device_public = app.base64url_encode(device_private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw))
+        self._write_options({
+            "e2ee_pairing_authorization": {
+                "token": "local-pairing-token",
+                "expires_at": app.iso_from_now(-1)
+            }
+        })
+
+        with self._server() as base_url:
+            status, body = self._request_json("POST", base_url, "/security/e2ee/pair", {
+                "protocol_version": 1,
+                "home_id": "11111111-1111-4111-8111-111111111111",
+                "device_id": "22222222-2222-4222-8222-222222222222",
+                "device_public_key": device_public,
+                "key_version": 1
+            }, headers={"X-SoSync-Local-Pairing-Token": "local-pairing-token"})
+
+        self.assertEqual(status, 401)
+        self.assertEqual(body["error"], "local_pairing_authorization_required")
+
     def test_addon_package_metadata_exposes_next_version_and_e2ee_schema(self):
         addon_root = Path(__file__).resolve().parents[1] / "besmart_companion"
         config = (addon_root / "config.yaml").read_text(encoding="utf-8")
