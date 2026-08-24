@@ -8,7 +8,7 @@ from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
-from cryptography.hazmat.primitives.asymmetric import ed25519
+from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
 from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat, PublicFormat, load_der_public_key
 from cryptography.exceptions import InvalidSignature
 
@@ -52,6 +52,66 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertIn("encryption_public_key", first[1])
         self.assertNotIn("signing_private_key", first[1])
         self.assertNotIn("encryption_private_key", first[1])
+
+    def test_e2ee_identity_route_is_exposed_by_addon_runtime(self):
+        with self._server() as base_url:
+            status, body = self._request_json("GET", base_url, "/security/e2ee/identity")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body["protocol_version"], 1)
+        self.assertEqual(body["key_version"], 1)
+        self.assertIn("companion_public_key", body)
+        self.assertNotIn("private_key", body)
+
+    def test_e2ee_pair_and_revoke_fail_closed_without_local_authorization(self):
+        with self._server() as base_url:
+            pair_status, pair_body = self._request_json("POST", base_url, "/security/e2ee/pair", {})
+            revoke_status, revoke_body = self._request_json("POST", base_url, "/security/e2ee/revoke", {})
+
+        self.assertEqual(pair_status, 401)
+        self.assertEqual(pair_body["error"], "local_pairing_authorization_required")
+        self.assertEqual(revoke_status, 401)
+        self.assertEqual(revoke_body["error"], "local_pairing_authorization_required")
+
+    def test_e2ee_pair_persists_record_and_consumes_local_authorization(self):
+        device_private = x25519.X25519PrivateKey.generate()
+        device_public = app.base64url_encode(device_private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw))
+        self._write_options({
+            "e2ee_pairing_authorization": {
+                "token": "local-pairing-token",
+                "expires_at": app.iso_from_now(120)
+            }
+        })
+
+        with self._server() as base_url:
+            status, body = self._request_json("POST", base_url, "/security/e2ee/pair", {
+                "protocol_version": 1,
+                "home_id": "11111111-1111-4111-8111-111111111111",
+                "device_id": "22222222-2222-4222-8222-222222222222",
+                "device_public_key": device_public,
+                "key_version": 1
+            }, headers={"X-SoSync-Local-Pairing-Token": "local-pairing-token"})
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "active")
+        self.assertEqual(body["device_id"], "22222222-2222-4222-8222-222222222222")
+        pairings = json.loads(Path(app.E2EE_PAIRINGS_FILE).read_text(encoding="utf-8"))
+        self.assertEqual(pairings["devices"]["22222222-2222-4222-8222-222222222222"]["status"], "active")
+        options = json.loads(Path(app.ADDON_OPTIONS_FILE).read_text(encoding="utf-8"))
+        self.assertNotIn("e2ee_pairing_authorization", options)
+
+    def test_addon_package_metadata_exposes_next_version_and_e2ee_schema(self):
+        addon_root = Path(__file__).resolve().parents[1] / "besmart_companion"
+        config = (addon_root / "config.yaml").read_text(encoding="utf-8")
+        dockerfile = (addon_root / "Dockerfile").read_text(encoding="utf-8")
+        runtime = (addon_root / "app.py").read_text(encoding="utf-8")
+
+        self.assertIn('version: "1.0.9"', config)
+        self.assertIn("e2ee_pairing_authorization", config)
+        self.assertIn("COPY app.py /app/app.py", dockerfile)
+        self.assertIn('self.path == "/security/e2ee/identity"', runtime)
+        self.assertIn('self.path == "/security/e2ee/pair"', runtime)
+        self.assertIn('self.path == "/security/e2ee/revoke"', runtime)
 
     def test_pairing_consume_hashes_secret_signs_receipt_and_rejects_replay(self):
         identity = app.ensure_companion_identity()
@@ -216,6 +276,8 @@ class CompanionP03Tests(unittest.TestCase):
         app.ADDON_OPTIONS_FILE = os.path.join(data_dir, "options.json")
         app.COMPANION_IDENTITY_FILE = os.path.join(data_dir, "besmart_companion_identity.json")
         app.PAIRINGS_FILE = os.path.join(data_dir, "besmart_pairings.json")
+        app.E2EE_IDENTITY_FILE = os.path.join(data_dir, "besmart_e2ee_identity.json")
+        app.E2EE_PAIRINGS_FILE = os.path.join(data_dir, "besmart_e2ee_pairings.json")
         app.CONSUMED_PACKAGES_FILE = os.path.join(data_dir, "besmart_consumed_setup_packages.json")
 
     def _patch_tailscale(self):
@@ -303,6 +365,7 @@ class CompanionP03Tests(unittest.TestCase):
         conn.request(method, path, body=payload, headers=request_headers)
         response = conn.getresponse()
         raw = response.read()
+        response.close()
         conn.close()
         return response.status, json.loads(raw.decode("utf-8") or "{}")
 

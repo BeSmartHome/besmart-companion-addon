@@ -1,7 +1,7 @@
 name: "BeSmart Companion"
 slug: "besmart_companion"
 description: "Local setup companion for BeSmart Home Server"
-version: "1.0.8"
+version: "1.0.9"
 
 arch:
   - aarch64
@@ -17,5 +17,9 @@ host_network: true
 
 options:
   backend_signing_public_key: ""
+  e2ee_pairing_authorization: {}
 schema:
   backend_signing_public_key: "str?"
+  e2ee_pairing_authorization:
+    token: "str?"
+    expires_at: "str?"

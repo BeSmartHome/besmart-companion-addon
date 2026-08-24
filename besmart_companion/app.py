@@ -44,12 +44,15 @@ HOME_PROFILE_FILE = os.path.join(DATA_DIR, "besmart_home_profile.json")
 ADDON_OPTIONS_FILE = os.path.join(DATA_DIR, "options.json")
 COMPANION_IDENTITY_FILE = os.path.join(DATA_DIR, "besmart_companion_identity.json")
 PAIRINGS_FILE = os.path.join(DATA_DIR, "besmart_pairings.json")
+E2EE_IDENTITY_FILE = os.path.join(DATA_DIR, "besmart_e2ee_identity.json")
+E2EE_PAIRINGS_FILE = os.path.join(DATA_DIR, "besmart_e2ee_pairings.json")
 CONSUMED_PACKAGES_FILE = os.path.join(DATA_DIR, "besmart_consumed_setup_packages.json")
 REMOTE_TOKEN_HEADER = "X-BeSmart-Remote-Token"
 HOME_PROFILE_PATH = "/besmart/home-profile"
 MAX_HOME_PROFILE_BYTES = 512 * 1024
 TAILSCALE_CONNECT_LOCK = threading.Lock()
 PAIRING_TTL_SECONDS = 120
+E2EE_PROTOCOL_VERSION = 1
 SETUP_PACKAGE_INFO = b"besmart-sosync-remote-setup-package-v1"
 SETUP_PACKAGE_ENCRYPTION_ALG = "HPKE-X25519-HKDF-SHA256-CHACHA20-POLY1305"
 SETUP_PACKAGE_SIGNATURE_ALG = "Ed25519"
@@ -107,6 +110,10 @@ class Handler(BaseHTTPRequestHandler):
                 "remote_url": read_remote_url(),
                 "tailscale_dns_name": tailscale_dns_name(read_tailscale_status())
             })
+            return
+
+        if self.path == "/security/e2ee/identity":
+            self._handle_e2ee_identity()
             return
 
         if self.path == "/tailscale/status":
@@ -311,7 +318,102 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_pairing_consume()
             return
 
+        if self.path == "/security/e2ee/pair":
+            self._handle_e2ee_pair()
+            return
+
+        if self.path == "/security/e2ee/revoke":
+            self._handle_e2ee_revoke()
+            return
+
         self._json(404, {"error": "not_found"})
+
+    def _handle_e2ee_identity(self):
+        identity = ensure_e2ee_identity()
+        self._json(200, {
+            "protocol_version": E2EE_PROTOCOL_VERSION,
+            "companion_public_key": identity["public_key"],
+            "key_version": identity["key_version"]
+        })
+
+    def _handle_e2ee_pair(self):
+        if not has_local_e2ee_pairing_authorization(self.headers):
+            self._json(401, {"error": "local_pairing_authorization_required"})
+            return
+
+        try:
+            data = self._read_json_body(16 * 1024)
+        except ValueError as error:
+            self._json(400, {"error": str(error)})
+            return
+
+        if data.get("protocol_version") != E2EE_PROTOCOL_VERSION:
+            self._json(426, {"error": "unsupported_protocol_version"})
+            return
+
+        home_id = opaque_e2ee_identifier(data.get("home_id"))
+        device_id = opaque_e2ee_identifier(data.get("device_id"))
+        device_public_key = normalized_e2ee_public_key(data.get("device_public_key"))
+        if not home_id or not device_id or not device_public_key:
+            self._json(400, {"error": "invalid_pairing_request"})
+            return
+
+        identity = ensure_e2ee_identity()
+        pairings = read_e2ee_pairings()
+        existing = pairings.get("devices", {}).get(device_id)
+        if existing and existing.get("status") == "revoked":
+            self._json(403, {"error": "device_revoked"})
+            return
+
+        record = make_e2ee_pairing_record(
+            home_id=home_id,
+            device_id=device_id,
+            device_public_key=device_public_key,
+            companion_public_key=identity["public_key"],
+            key_version=identity["key_version"]
+        )
+        pairings.setdefault("devices", {})[device_id] = record
+        write_json_file_secure(E2EE_PAIRINGS_FILE, pairings)
+        clear_e2ee_pairing_authorization()
+        print(f"[SOSYNC-E2EE] pairingCompleted deviceID={device_id[:8]}", flush=True)
+        print("[SOSYNC-E2EE] pairingPersisted local=false companion=true", flush=True)
+        self._json(200, {
+            "protocol_version": E2EE_PROTOCOL_VERSION,
+            "home_id": record["home_id"],
+            "device_id": record["device_id"],
+            "companion_public_key": record["companion_public_key"],
+            "key_version": record["key_version"],
+            "status": record["status"]
+        })
+
+    def _handle_e2ee_revoke(self):
+        if not has_local_e2ee_pairing_authorization(self.headers):
+            self._json(401, {"error": "local_pairing_authorization_required"})
+            return
+
+        try:
+            data = self._read_json_body(8 * 1024)
+        except ValueError as error:
+            self._json(400, {"error": str(error)})
+            return
+
+        device_id = opaque_e2ee_identifier(data.get("device_id"))
+        pairings = read_e2ee_pairings()
+        existing = pairings.get("devices", {}).get(device_id) if device_id else None
+        if not existing:
+            self._json(404, {"error": "pairing_not_found"})
+            return
+
+        existing = dict(existing)
+        existing["status"] = "revoked"
+        existing["revoked_at"] = iso_now()
+        pairings.setdefault("devices", {})[device_id] = existing
+        write_json_file_secure(E2EE_PAIRINGS_FILE, pairings)
+        self._json(200, {
+            "protocol_version": E2EE_PROTOCOL_VERSION,
+            "device_id": device_id,
+            "status": "revoked"
+        })
 
     def _handle_pairing_consume(self):
         try:
@@ -1109,6 +1211,102 @@ def ensure_companion_identity():
     return identity
 
 
+def ensure_e2ee_identity():
+    identity = read_json_file(E2EE_IDENTITY_FILE, None)
+    if (
+        isinstance(identity, dict) and
+        identity.get("public_key") and
+        identity.get("private_key") and
+        identity.get("key_version")
+    ):
+        return identity
+
+    private_key = x25519.X25519PrivateKey.generate()
+    public_key = private_key.public_key()
+    identity = {
+        "protocol_version": E2EE_PROTOCOL_VERSION,
+        "algorithm": "X25519",
+        "public_key": base64url_encode(public_key.public_bytes(Encoding.Raw, PublicFormat.Raw)),
+        "private_key": base64url_encode(private_key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())),
+        "key_version": 1,
+        "created_at": iso_now()
+    }
+    write_json_file_secure(E2EE_IDENTITY_FILE, identity)
+    return identity
+
+
+def read_e2ee_pairings():
+    pairings = read_json_file(E2EE_PAIRINGS_FILE, {"devices": {}})
+    if not isinstance(pairings, dict):
+        return {"devices": {}}
+    if not isinstance(pairings.get("devices"), dict):
+        pairings["devices"] = {}
+    return pairings
+
+
+def make_e2ee_pairing_record(home_id, device_id, device_public_key, companion_public_key, key_version):
+    return {
+        "protocol_version": E2EE_PROTOCOL_VERSION,
+        "home_id": home_id,
+        "device_id": device_id,
+        "device_public_key": device_public_key,
+        "companion_public_key": companion_public_key,
+        "created_at": iso_now(),
+        "key_version": key_version,
+        "status": "active"
+    }
+
+
+def has_local_e2ee_pairing_authorization(headers):
+    options = read_json_file(ADDON_OPTIONS_FILE, {})
+    authorization = options.get("e2ee_pairing_authorization") if isinstance(options, dict) else None
+    if not isinstance(authorization, dict):
+        return False
+
+    expected = str(authorization.get("token") or "").strip()
+    expires_at = authorization.get("expires_at")
+    if not expected or is_expired_iso(expires_at):
+        return False
+
+    received = str(headers.get("X-SoSync-Local-Pairing-Token") or "").strip()
+    authorized = bool(received) and hmac.compare_digest(received, expected)
+    if authorized:
+        print("[SOSYNC-E2EE] pairingAuthorization source=supervisorOptions result=available", flush=True)
+    return authorized
+
+
+def clear_e2ee_pairing_authorization():
+    options = read_json_file(ADDON_OPTIONS_FILE, {})
+    if not isinstance(options, dict):
+        return
+    changed = False
+    for key in ("e2ee_pairing_authorization", "e2eePairingAuthorization", "localPairingToken", "local_pairing_token"):
+        if key in options:
+            options.pop(key, None)
+            changed = True
+    if changed:
+        write_json_file_secure(ADDON_OPTIONS_FILE, options)
+
+
+def opaque_e2ee_identifier(value):
+    candidate = str(value or "").strip()
+    if re.fullmatch(r"[0-9A-Fa-f-]{16,64}", candidate):
+        return candidate
+    return ""
+
+
+def normalized_e2ee_public_key(value):
+    candidate = str(value or "").strip()
+    try:
+        raw = base64url_decode(candidate)
+        if len(raw) != 32:
+            return ""
+        x25519.X25519PublicKey.from_public_bytes(raw)
+        return base64url_encode(raw)
+    except (ValueError, TypeError):
+        return ""
+
+
 def ingest_remote_pairing_from_supervisor_config():
     options = read_json_file(ADDON_OPTIONS_FILE, {})
     remote_pairing = options.get("remote_pairing") if isinstance(options, dict) else None
@@ -1413,5 +1611,6 @@ def tailscale_dns_name(status_data):
 
 if __name__ == "__main__":
     print(f"BeSmart Companion listening on port {PORT}")
+    print("[SOSYNC-E2EE-COMPANION] routesRegistered identity=true pair=true revoke=true protocol=1", flush=True)
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     server.serve_forever()
