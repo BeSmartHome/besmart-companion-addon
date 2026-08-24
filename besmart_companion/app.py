@@ -56,6 +56,8 @@ E2EE_PROTOCOL_VERSION = 1
 SETUP_PACKAGE_INFO = b"besmart-sosync-remote-setup-package-v1"
 SETUP_PACKAGE_ENCRYPTION_ALG = "HPKE-X25519-HKDF-SHA256-CHACHA20-POLY1305"
 SETUP_PACKAGE_SIGNATURE_ALG = "Ed25519"
+RUNTIME_INSTANCE_ID = str(uuid.uuid4())
+RUNTIME_STARTED_AT = datetime.now(timezone.utc).isoformat()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -106,6 +108,8 @@ class Handler(BaseHTTPRequestHandler):
                 "encryption_public_key": identity["encryption_public_key"],
                 "setup_counter": identity.get("setup_counter", 0),
                 "minimum_protocol_version": 1,
+                "runtime_instance_id": RUNTIME_INSTANCE_ID,
+                "runtime_started_at": RUNTIME_STARTED_AT,
                 "server_id": get_or_create_server_id(),
                 "remote_url": read_remote_url(),
                 "tailscale_dns_name": tailscale_dns_name(read_tailscale_status())
@@ -114,6 +118,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == "/security/e2ee/identity":
             self._handle_e2ee_identity()
+            return
+
+        if self.path == "/security/e2ee/pairing-authorization":
+            self._handle_e2ee_pairing_authorization_status()
             return
 
         if self.path == "/tailscale/status":
@@ -335,6 +343,9 @@ class Handler(BaseHTTPRequestHandler):
             "companion_public_key": identity["public_key"],
             "key_version": identity["key_version"]
         })
+
+    def _handle_e2ee_pairing_authorization_status(self):
+        self._json(200, e2ee_pairing_authorization_status())
 
     def _handle_e2ee_pair(self):
         if not has_local_e2ee_pairing_authorization(self.headers):
@@ -1296,6 +1307,47 @@ def has_local_e2ee_pairing_authorization(headers):
     return authorized
 
 
+def e2ee_pairing_authorization_status():
+    options = read_json_file(ADDON_OPTIONS_FILE, {})
+    authorization = options.get("e2ee_pairing_authorization") if isinstance(options, dict) else None
+    if not isinstance(authorization, dict):
+        return {
+            "protocol_version": E2EE_PROTOCOL_VERSION,
+            "configured": False,
+            "token_fingerprint": "none",
+            "expires_parse_success": False,
+            "expires_epoch": 0,
+            "now_epoch": int(time.time()),
+            "expired": False
+        }
+
+    token = str(authorization.get("token") or "").strip()
+    expires_parse = parse_iso_epoch(authorization.get("expires_at"))
+    now_epoch = int(time.time())
+    expires_epoch = int(expires_parse[1]) if expires_parse[1] is not None else 0
+    expired = bool(expires_parse[0] and expires_epoch <= now_epoch)
+    return {
+        "protocol_version": E2EE_PROTOCOL_VERSION,
+        "configured": bool(token),
+        "token_fingerprint": token_fingerprint(token),
+        "expires_parse_success": bool(expires_parse[0]),
+        "expires_epoch": expires_epoch,
+        "now_epoch": now_epoch,
+        "expired": expired
+    }
+
+
+def log_pairing_authorization_loaded():
+    status = e2ee_pairing_authorization_status()
+    print(
+        "[SOSYNC-E2EE-COMPANION] "
+        f"pairingAuthorizationLoaded runtimeInstance={RUNTIME_INSTANCE_ID} "
+        f"configured={status['configured']} "
+        f"tokenFingerprint={status['token_fingerprint']}",
+        flush=True
+    )
+
+
 def token_fingerprint(value):
     candidate = str(value or "").strip()
     if not candidate:
@@ -1653,7 +1705,10 @@ def tailscale_dns_name(status_data):
 
 
 if __name__ == "__main__":
-    print(f"BeSmart Companion listening on port {PORT}")
-    print("[SOSYNC-E2EE-COMPANION] routesRegistered identity=true pair=true revoke=true protocol=1", flush=True)
+    print(f"[SOSYNC-E2EE-COMPANION] runtimeStarted runtimeInstance={RUNTIME_INSTANCE_ID}", flush=True)
+    log_pairing_authorization_loaded()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    print(f"BeSmart Companion listening on port {PORT}")
+    print(f"[SOSYNC-E2EE-COMPANION] runtimeListening runtimeInstance={RUNTIME_INSTANCE_ID} port={PORT}", flush=True)
+    print("[SOSYNC-E2EE-COMPANION] routesRegistered identity=true pairingAuthorization=true pair=true revoke=true protocol=1", flush=True)
     server.serve_forever()

@@ -50,6 +50,9 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertEqual(first[1]["companion_id"], second[1]["companion_id"])
         self.assertIn("signing_public_key", first[1])
         self.assertIn("encryption_public_key", first[1])
+        self.assertIn("runtime_instance_id", first[1])
+        self.assertIn("runtime_started_at", first[1])
+        self.assertEqual(first[1]["runtime_instance_id"], second[1]["runtime_instance_id"])
         self.assertNotIn("signing_private_key", first[1])
         self.assertNotIn("encryption_private_key", first[1])
 
@@ -62,6 +65,25 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertEqual(body["key_version"], 1)
         self.assertIn("companion_public_key", body)
         self.assertNotIn("private_key", body)
+
+    def test_e2ee_pairing_authorization_status_exposes_only_safe_runtime_state(self):
+        self._write_options({
+            "e2ee_pairing_authorization": {
+                "token": "local-pairing-token",
+                "expires_at": app.iso_from_now(120)
+            }
+        })
+
+        with self._server() as base_url:
+            status, body = self._request_json("GET", base_url, "/security/e2ee/pairing-authorization")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body["protocol_version"], 1)
+        self.assertTrue(body["configured"])
+        self.assertEqual(body["token_fingerprint"], app.token_fingerprint("local-pairing-token"))
+        self.assertTrue(body["expires_parse_success"])
+        self.assertFalse(body["expired"])
+        self.assertNotIn("token", body)
 
     def test_e2ee_pair_and_revoke_fail_closed_without_local_authorization(self):
         with self._server() as base_url:
@@ -128,7 +150,7 @@ class CompanionP03Tests(unittest.TestCase):
         dockerfile = (addon_root / "Dockerfile").read_text(encoding="utf-8")
         runtime = (addon_root / "app.py").read_text(encoding="utf-8")
 
-        self.assertIn('version: "1.0.9"', config)
+        self.assertIn('version: "1.0.11"', config)
         self.assertIn("e2ee_pairing_authorization", config)
         self.assertIn("COPY app.py /app/app.py", dockerfile)
         self.assertIn('self.path == "/security/e2ee/identity"', runtime)
