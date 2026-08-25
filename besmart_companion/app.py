@@ -66,8 +66,8 @@ SETUP_PACKAGE_ENCRYPTION_ALG = "HPKE-X25519-HKDF-SHA256-CHACHA20-POLY1305"
 SETUP_PACKAGE_SIGNATURE_ALG = "Ed25519"
 RUNTIME_INSTANCE_ID = str(uuid.uuid4())
 RUNTIME_STARTED_AT = datetime.now(timezone.utc).isoformat()
-SOSYNC_COMPANION_VERSION = os.environ.get("SOSYNC_COMPANION_VERSION", "1.0.15")
-SOSYNC_COMPANION_BUILD = os.environ.get("SOSYNC_COMPANION_BUILD", "1.0.15-secure-remote-dataplane-diag-v1")
+SOSYNC_COMPANION_VERSION = os.environ.get("SOSYNC_COMPANION_VERSION", "1.0.16")
+SOSYNC_COMPANION_BUILD = os.environ.get("SOSYNC_COMPANION_BUILD", "1.0.16-secure-remote-prepare-contract-v1")
 SECURE_REMOTE_TUNNEL_CONFIRMATION_SECONDS = float(os.environ.get("SOSYNC_TUNNEL_CONFIRMATION_SECONDS", "1.0"))
 SECURE_REMOTE_TUNNEL_LOCK = threading.Lock()
 SECURE_REMOTE_TUNNEL_PROCESS = None
@@ -459,10 +459,12 @@ class Handler(BaseHTTPRequestHandler):
         if not is_valid_secure_remote_binding_request(data):
             self._json(400, {"error": "invalid_secure_remote_binding"})
             return
+        stop_secure_remote_tunnel()
+        remove_secure_file(secure_remote_tunnel_token_file())
         binding = make_secure_remote_binding(data)
         write_json_file_secure(SECURE_REMOTE_BINDING_FILE, binding)
         print(
-            f"[SOSYNC-SECURE-REMOTE-COMPANION] bindingPrepared route={safe_fingerprint(binding.get('route_id'))} credentialVersion={binding.get('credential_version')}",
+            f"[SOSYNC-SECURE-REMOTE-COMPANION] bindingPrepared route={safe_fingerprint(binding.get('route_id'))} credentialVersion={binding.get('credential_version')} staleCredentialCleared=true",
             flush=True
         )
         self._json(200, secure_remote_public_status(binding))
@@ -2115,6 +2117,15 @@ def read_secure_text_file(path):
             return file.read().strip()
     except OSError:
         return ""
+
+
+def remove_secure_file(path):
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
 
 
 def secure_remote_tunnel_token_file():
