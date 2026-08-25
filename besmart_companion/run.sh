@@ -5,6 +5,7 @@ set -e
 echo "Starting BeSmart Companion..."
 
 mkdir -p /data/tailscale
+mkdir -p /data/cloudflared
 mkdir -p /var/run/tailscale
 
 if [ -z "${BESMART_BACKEND_SIGNING_PUBLIC_KEY:-}" ] && [ -f /data/options.json ]; then

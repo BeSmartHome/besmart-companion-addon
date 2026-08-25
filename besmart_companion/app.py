@@ -6,6 +6,7 @@ import json
 import os
 import re
 import select
+import shutil
 import socket
 import subprocess
 import sys
@@ -51,6 +52,8 @@ PAIRINGS_FILE = os.path.join(DATA_DIR, "besmart_pairings.json")
 E2EE_IDENTITY_FILE = os.path.join(DATA_DIR, "besmart_e2ee_identity.json")
 E2EE_PAIRINGS_FILE = os.path.join(DATA_DIR, "besmart_e2ee_pairings.json")
 SECURE_REMOTE_BINDING_FILE = os.path.join(DATA_DIR, "besmart_secure_remote_binding.json")
+SECURE_REMOTE_TUNNEL_TOKEN_FILE = os.path.join(DATA_DIR, "besmart_secure_remote_tunnel_token")
+SECURE_REMOTE_TUNNEL_STDERR_FILE = os.path.join(DATA_DIR, "besmart_secure_remote_cloudflared_stderr.log")
 CONSUMED_PACKAGES_FILE = os.path.join(DATA_DIR, "besmart_consumed_setup_packages.json")
 REMOTE_TOKEN_HEADER = "X-BeSmart-Remote-Token"
 HOME_PROFILE_PATH = "/besmart/home-profile"
@@ -63,8 +66,11 @@ SETUP_PACKAGE_ENCRYPTION_ALG = "HPKE-X25519-HKDF-SHA256-CHACHA20-POLY1305"
 SETUP_PACKAGE_SIGNATURE_ALG = "Ed25519"
 RUNTIME_INSTANCE_ID = str(uuid.uuid4())
 RUNTIME_STARTED_AT = datetime.now(timezone.utc).isoformat()
+SOSYNC_COMPANION_BUILD = os.environ.get("SOSYNC_COMPANION_BUILD", "1.0.13-secure-remote-tunnel-v1")
+SECURE_REMOTE_TUNNEL_LOCK = threading.Lock()
+SECURE_REMOTE_TUNNEL_PROCESS = None
 print(
-    f"[SOSYNC-E2EE-COMPANION] runtimeGlobalsInitialized runtimeInstance={RUNTIME_INSTANCE_ID}",
+    f"[SOSYNC-E2EE-COMPANION] runtimeGlobalsInitialized runtimeInstance={RUNTIME_INSTANCE_ID} build={SOSYNC_COMPANION_BUILD}",
     flush=True
 )
 
@@ -92,6 +98,14 @@ class Handler(BaseHTTPRequestHandler):
             self._proxy_signed_home_assistant()
             return
 
+        if self.path == "/secure-remote/data-plane/health":
+            self._handle_secure_remote_dataplane_health()
+            return
+
+        if self.path.startswith("/secure-remote/data-plane/ha"):
+            self._proxy_secure_remote_home_assistant()
+            return
+
         if self.path.startswith(REMOTE_PREFIX):
             self._proxy_home_assistant()
             return
@@ -103,7 +117,10 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self._json(200, {
                 "status": "ok",
-                "service": "besmart-companion"
+                "service": "besmart-companion",
+                "build": SOSYNC_COMPANION_BUILD,
+                "runtime_instance_id": RUNTIME_INSTANCE_ID,
+                "runtime_started_at": RUNTIME_STARTED_AT
             })
             return
 
@@ -119,6 +136,7 @@ class Handler(BaseHTTPRequestHandler):
                 "minimum_protocol_version": 1,
                 "runtime_instance_id": RUNTIME_INSTANCE_ID,
                 "runtime_started_at": RUNTIME_STARTED_AT,
+                "build": SOSYNC_COMPANION_BUILD,
                 "server_id": get_or_create_server_id(),
                 "remote_url": read_remote_url(),
                 "tailscale_dns_name": tailscale_dns_name(read_tailscale_status())
@@ -367,6 +385,10 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_secure_remote_tunnel_rotate()
             return
 
+        if self.path.startswith("/secure-remote/data-plane/ha"):
+            self._proxy_secure_remote_home_assistant()
+            return
+
         if self.path == "/secure-remote/revoke":
             self._handle_secure_remote_revoke()
             return
@@ -445,16 +467,30 @@ class Handler(BaseHTTPRequestHandler):
         # The connector credential is accepted only for local connector runtime use.
         # It is never returned by identity/status and never logged.
         credential_present = isinstance(data.get("tunnel_credential"), str) and bool(str(data.get("tunnel_credential")).strip())
-        binding["tunnel_configured"] = credential_present
+        print(
+            f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelConfigurationStarted route={safe_fingerprint(binding.get('route_id'))} credentialVersion={credential_version}",
+            flush=True
+        )
         binding["credential_version"] = credential_version
-        binding["tunnel_state"] = "configured" if credential_present else "metadata_only"
+        if credential_present:
+            write_secure_text_file(secure_remote_tunnel_token_file(), str(data.get("tunnel_credential")).strip())
+            print(
+                f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelCredentialInstalled route={safe_fingerprint(binding.get('route_id'))} credentialVersion={credential_version}",
+                flush=True
+            )
+            process_started = start_secure_remote_tunnel(binding)
+            binding["tunnel_configured"] = process_started
+            binding["tunnel_state"] = "connecting" if process_started else "failed"
+        else:
+            binding["tunnel_configured"] = False
+            binding["tunnel_state"] = "metadata_only"
         binding["updated_at"] = iso_now()
         write_json_file_secure(SECURE_REMOTE_BINDING_FILE, binding)
         print(
             f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelInstall route={safe_fingerprint(binding.get('route_id'))} credentialVersion={credential_version} credentialPresent={credential_present}",
             flush=True
         )
-        self._json(200, secure_remote_public_status(binding))
+        self._json(200 if binding["tunnel_configured"] else 503, secure_remote_public_status(binding))
 
     def _handle_secure_remote_tunnel_rotate(self):
         if not self._authorize_secure_remote_control_plane():
@@ -473,15 +509,22 @@ class Handler(BaseHTTPRequestHandler):
             self._json(409, {"error": "stale_credential_version"})
             return
         binding["credential_version"] = credential_version
-        binding["tunnel_configured"] = isinstance(data.get("tunnel_credential"), str) and bool(str(data.get("tunnel_credential")).strip())
-        binding["tunnel_state"] = "configured"
+        credential_present = isinstance(data.get("tunnel_credential"), str) and bool(str(data.get("tunnel_credential")).strip())
+        if credential_present:
+            write_secure_text_file(secure_remote_tunnel_token_file(), str(data.get("tunnel_credential")).strip())
+            process_started = start_secure_remote_tunnel(binding)
+            binding["tunnel_configured"] = process_started
+            binding["tunnel_state"] = "connecting" if process_started else "failed"
+        else:
+            binding["tunnel_configured"] = False
+            binding["tunnel_state"] = "metadata_only"
         binding["updated_at"] = iso_now()
         write_json_file_secure(SECURE_REMOTE_BINDING_FILE, binding)
         print(
             f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelRotate route={safe_fingerprint(binding.get('route_id'))} credentialVersion={credential_version}",
             flush=True
         )
-        self._json(200, secure_remote_public_status(binding))
+        self._json(200 if binding["tunnel_configured"] else 503, secure_remote_public_status(binding))
 
     def _handle_secure_remote_revoke(self):
         if not self._authorize_secure_remote_control_plane():
@@ -499,11 +542,58 @@ class Handler(BaseHTTPRequestHandler):
         binding["revoked_at"] = iso_now()
         binding["tunnel_state"] = "revoked"
         write_json_file_secure(SECURE_REMOTE_BINDING_FILE, binding)
+        stop_secure_remote_tunnel()
         print(
             f"[SOSYNC-SECURE-REMOTE-COMPANION] revoked route={safe_fingerprint(binding.get('route_id'))}",
             flush=True
         )
         self._json(200, secure_remote_public_status(binding))
+
+    def _authorize_secure_remote_dataplane(self):
+        binding = read_secure_remote_binding()
+        if not binding.get("route_id") or binding.get("status") == "revoked":
+            self._json(403, {"error": "secure_remote_not_bound"})
+            return None
+        route = self.headers.get("X-SoSync-Secure-Remote-Route")
+        token = self.headers.get("X-SoSync-Secure-Remote-Origin-Token")
+        stored_token = str(binding.get("origin_access_token") or "").strip()
+        route_ok = hmac.compare_digest(str(route or ""), str(binding.get("tunnel_binding_id") or ""))
+        token_ok = bool(stored_token) and hmac.compare_digest(str(token or ""), stored_token)
+        if not route_ok or not token_ok:
+            self._json(401, {"error": "unauthorized"})
+            return None
+        return binding
+
+    def _handle_secure_remote_dataplane_health(self):
+        binding = self._authorize_secure_remote_dataplane()
+        if not binding:
+            return
+        process_running = is_secure_remote_tunnel_running()
+        if process_running:
+            binding["tunnel_state"] = "active"
+            binding["last_healthy_at"] = iso_now()
+            binding["updated_at"] = iso_now()
+            write_json_file_secure(SECURE_REMOTE_BINDING_FILE, binding)
+        self._json(200 if process_running else 503, {
+            "status": "ok" if process_running else "unavailable",
+            "tunnel_state": binding.get("tunnel_state") or "unconfigured",
+            "route_id_fingerprint": safe_fingerprint(binding.get("route_id"))
+        })
+
+    def _proxy_secure_remote_home_assistant(self):
+        binding = self._authorize_secure_remote_dataplane()
+        if not binding:
+            return
+        parsed_remote_path = urlparse(self.path)
+        ha_path = parsed_remote_path.path[len("/secure-remote/data-plane/ha"):] or "/"
+        if not is_allowed_ha_path(ha_path) and not (ha_path == "/auth/token" and self.command == "POST"):
+            self._json(403, {"error": "route_not_allowed"})
+            return
+        print(
+            f"[SOSYNC-SECURE-REMOTE-DATAPLANE] companionProxy method={self.command} upstreamPath={sanitize_ha_path_for_log(ha_path)}",
+            flush=True
+        )
+        self._proxy_home_assistant_path(ha_path, parsed_remote_path.query)
 
     def _handle_e2ee_identity(self):
         identity = ensure_e2ee_identity()
@@ -1870,6 +1960,8 @@ def is_valid_secure_remote_binding_request(data):
         return False
     if not is_opaque_secure_remote_id(data.get("tunnel_binding_id"), "tun_"):
         return False
+    if data.get("origin_access_token") is not None and not is_opaque_secure_remote_id(data.get("origin_access_token"), "orig_"):
+        return False
     required_fingerprints = [
         "home_reference",
         "device_reference",
@@ -1900,6 +1992,8 @@ def make_secure_remote_binding(data):
         "companion_public_key_fingerprint": str(data.get("companion_public_key_fingerprint")).strip(),
         "companion_identity_fingerprint": str(data.get("companion_identity_fingerprint")).strip(),
         "credential_version": int(data.get("credential_version") or 1),
+        "origin_access_token": str(data.get("origin_access_token") or "").strip(),
+        "public_hostname": str(data.get("public_hostname") or "").strip(),
         "status": "control_plane_bound",
         "tunnel_configured": False,
         "tunnel_state": "pending",
@@ -1922,9 +2016,145 @@ def secure_remote_public_status(binding=None):
         "tunnel_configured": bool(binding.get("tunnel_configured")),
         "tunnel_state": binding.get("tunnel_state") or "unconfigured",
         "last_healthy_at": binding.get("last_healthy_at"),
+        "cloudflared_running": is_secure_remote_tunnel_running(),
         "updated_at": binding.get("updated_at"),
         "revoked_at": binding.get("revoked_at")
     }
+
+
+def write_secure_text_file(path, value):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temporary_file = f"{path}.tmp"
+    with open(temporary_file, "w", encoding="utf-8") as file:
+        file.write(value)
+    os.chmod(temporary_file, 0o600)
+    os.replace(temporary_file, path)
+    os.chmod(path, 0o600)
+
+
+def read_secure_text_file(path):
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            return file.read().strip()
+    except OSError:
+        return ""
+
+
+def secure_remote_tunnel_token_file():
+    return os.path.join(os.path.dirname(SECURE_REMOTE_BINDING_FILE), "besmart_secure_remote_tunnel_token")
+
+
+def secure_remote_tunnel_stderr_file():
+    return os.path.join(os.path.dirname(SECURE_REMOTE_BINDING_FILE), "besmart_secure_remote_cloudflared_stderr.log")
+
+
+def read_secure_remote_tunnel_stderr_excerpt(limit=1024):
+    path = secure_remote_tunnel_stderr_file()
+    try:
+        with open(path, "rb") as file:
+            file.seek(0, os.SEEK_END)
+            size = file.tell()
+            file.seek(max(0, size - limit), os.SEEK_SET)
+            return file.read(limit).decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def sanitized_secure_remote_tunnel_stderr(value, token):
+    text = str(value or "")
+    secret = str(token or "")
+    if secret:
+        text = text.replace(secret, "[redacted]")
+        if len(secret) > 12:
+            text = text.replace(secret[:12], "[redacted]")
+            text = text.replace(secret[-12:], "[redacted]")
+        for component in secret.split("-"):
+            if len(component) >= 8:
+                text = text.replace(component, "[redacted]")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:300] if text else "empty"
+
+
+def is_secure_remote_tunnel_running():
+    global SECURE_REMOTE_TUNNEL_PROCESS
+    with SECURE_REMOTE_TUNNEL_LOCK:
+        return SECURE_REMOTE_TUNNEL_PROCESS is not None and SECURE_REMOTE_TUNNEL_PROCESS.poll() is None
+
+
+def start_secure_remote_tunnel(binding=None):
+    global SECURE_REMOTE_TUNNEL_PROCESS
+    binding = binding if isinstance(binding, dict) else read_secure_remote_binding()
+    token = read_secure_text_file(secure_remote_tunnel_token_file())
+    if not token or not binding.get("route_id") or binding.get("status") == "revoked":
+        print(
+            f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelProcessNotStarted route={safe_fingerprint(binding.get('route_id'))} reason=missingCredentialOrRoute",
+            flush=True
+        )
+        return False
+    with SECURE_REMOTE_TUNNEL_LOCK:
+        if SECURE_REMOTE_TUNNEL_PROCESS is not None and SECURE_REMOTE_TUNNEL_PROCESS.poll() is None:
+            print(
+                f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelProcessStarted route={safe_fingerprint(binding.get('route_id'))} reused=true",
+                flush=True
+            )
+            return True
+        cloudflared_binary = os.environ.get("BESMART_CLOUDFLARED_BIN", "cloudflared")
+        if shutil.which(cloudflared_binary) is None:
+            print(
+                f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelProcessFailed route={safe_fingerprint(binding.get('route_id'))} stage=binaryLookup reason=cloudflaredMissing",
+                flush=True
+            )
+            return False
+        env = os.environ.copy()
+        env["TUNNEL_TOKEN"] = token
+        try:
+            stderr_path = secure_remote_tunnel_stderr_file()
+            os.makedirs(os.path.dirname(stderr_path), exist_ok=True)
+            with open(stderr_path, "wb") as stderr_file:
+                SECURE_REMOTE_TUNNEL_PROCESS = subprocess.Popen(
+                    [cloudflared_binary, "--no-autoupdate", "tunnel", "run"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=stderr_file,
+                    env=env
+                )
+            time.sleep(0.25)
+            exit_code = SECURE_REMOTE_TUNNEL_PROCESS.poll()
+            if exit_code is not None:
+                stderr_excerpt = sanitized_secure_remote_tunnel_stderr(
+                    read_secure_remote_tunnel_stderr_excerpt(),
+                    token
+                )
+                print(
+                    f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelProcessFailed route={safe_fingerprint(binding.get('route_id'))} stage=processStart reason=exited code={exit_code} stderr={stderr_excerpt}",
+                    flush=True
+                )
+                SECURE_REMOTE_TUNNEL_PROCESS = None
+                return False
+            print(
+                f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelProcessStarted route={safe_fingerprint(binding.get('route_id'))} reused=false",
+                flush=True
+            )
+            return True
+        except Exception as error:
+            print(
+                f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelRuntimeFailed route={safe_fingerprint(binding.get('route_id'))} error={type(error).__name__}",
+                flush=True
+            )
+            SECURE_REMOTE_TUNNEL_PROCESS = None
+            return False
+
+
+def stop_secure_remote_tunnel():
+    global SECURE_REMOTE_TUNNEL_PROCESS
+    with SECURE_REMOTE_TUNNEL_LOCK:
+        process = SECURE_REMOTE_TUNNEL_PROCESS
+        SECURE_REMOTE_TUNNEL_PROCESS = None
+    if process is not None and process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
 
 
 def base64url_encode(value):
@@ -2082,15 +2312,17 @@ def tailscale_dns_name(status_data):
 
 
 def main():
-    print(f"[SOSYNC-E2EE-COMPANION] runtimeStarted runtimeInstance={RUNTIME_INSTANCE_ID}", flush=True)
+    print(f"[SOSYNC-E2EE-COMPANION] runtimeStarted runtimeInstance={RUNTIME_INSTANCE_ID} build={SOSYNC_COMPANION_BUILD}", flush=True)
     log_e2ee_pairing_store_loaded()
     log_pairing_authorization_loaded()
+    if read_secure_remote_binding().get("tunnel_configured"):
+        start_secure_remote_tunnel()
     print("[SOSYNC-E2EE-COMPANION] serverConstructionStarted", flush=True)
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"BeSmart Companion listening on port {PORT}")
     print(f"[SOSYNC-E2EE-COMPANION] runtimeListening runtimeInstance={RUNTIME_INSTANCE_ID} port={PORT}", flush=True)
     print("[SOSYNC-E2EE-COMPANION] routesRegistered identity=true pairingAuthorization=true pair=true revoke=true protocol=1", flush=True)
-    print("[SOSYNC-SECURE-REMOTE-COMPANION] routesRegistered identity=true status=true provision=true tunnelInstall=true tunnelRotate=true revoke=true dataPlane=false", flush=True)
+    print("[SOSYNC-SECURE-REMOTE-COMPANION] routesRegistered identity=true status=true provision=true tunnelInstall=true tunnelRotate=true revoke=true dataPlane=true", flush=True)
     server.serve_forever()
 
 
