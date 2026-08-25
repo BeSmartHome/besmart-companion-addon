@@ -150,7 +150,7 @@ class CompanionP03Tests(unittest.TestCase):
         dockerfile = (addon_root / "Dockerfile").read_text(encoding="utf-8")
         runtime = (addon_root / "app.py").read_text(encoding="utf-8")
 
-        self.assertIn('version: "1.0.11"', config)
+        self.assertIn('version: "1.0.12"', config)
         self.assertIn("e2ee_pairing_authorization", config)
         self.assertIn("COPY app.py /app/app.py", dockerfile)
         self.assertIn('self.path == "/security/e2ee/identity"', runtime)
@@ -310,6 +310,78 @@ class CompanionP03Tests(unittest.TestCase):
         if authorized == 200:
             self.assertIsInstance(body, dict)
 
+    def test_secure_remote_control_plane_persists_metadata_without_exposing_credentials(self):
+        route_id = "r_abcdefghijklmnopqrstuvwxyz123456"
+        tunnel_id = "tun_abcdefghijklmnopqrstuvwxyz123456"
+        with self._server() as base_url:
+            identity_status, identity = self._request_json("GET", base_url, "/secure-remote/identity")
+            provision_status, provision = self._request_json("POST", base_url, "/secure-remote/provision", {
+                "protocol_version": 1,
+                "route_id": route_id,
+                "tunnel_binding_id": tunnel_id,
+                "home_reference": "home_ref",
+                "device_reference": "device_ref",
+                "device_public_key_fingerprint": "device_fp",
+                "companion_public_key_fingerprint": "companion_key_fp",
+                "companion_identity_fingerprint": "companion_identity_fp",
+                "credential_version": 1
+            })
+            install_status, install = self._request_json("POST", base_url, "/secure-remote/tunnel/install", {
+                "protocol_version": 1,
+                "route_id": route_id,
+                "credential_version": 1,
+                "tunnel_credential": "secret-tunnel-credential"
+            })
+            status_code, status = self._request_json("GET", base_url, "/secure-remote/status")
+
+        self.assertEqual(identity_status, 200)
+        self.assertIn("companion_public_key_fingerprint", identity)
+        self.assertEqual(provision_status, 200)
+        self.assertEqual(install_status, 200)
+        self.assertEqual(status_code, 200)
+        self.assertTrue(provision["configured"])
+        self.assertTrue(install["tunnel_configured"])
+        self.assertTrue(status["tunnel_configured"])
+        self.assertEqual(status["credential_version"], 1)
+        serialized = json.dumps(status)
+        self.assertNotIn("secret-tunnel-credential", serialized)
+        self.assertNotIn("tunnel_credential", serialized)
+
+    def test_secure_remote_rejects_semantic_route_and_stale_rotation(self):
+        route_id = "r_abcdefghijklmnopqrstuvwxyz123456"
+        with self._server() as base_url:
+            bad_status, _ = self._request_json("POST", base_url, "/secure-remote/provision", {
+                "protocol_version": 1,
+                "route_id": "basjir-home",
+                "tunnel_binding_id": "tun_abcdefghijklmnopqrstuvwxyz123456",
+                "home_reference": "home_ref",
+                "device_reference": "device_ref",
+                "device_public_key_fingerprint": "device_fp",
+                "companion_public_key_fingerprint": "companion_key_fp",
+                "companion_identity_fingerprint": "companion_identity_fp",
+                "credential_version": 1
+            })
+            self._request_json("POST", base_url, "/secure-remote/provision", {
+                "protocol_version": 1,
+                "route_id": route_id,
+                "tunnel_binding_id": "tun_abcdefghijklmnopqrstuvwxyz123456",
+                "home_reference": "home_ref",
+                "device_reference": "device_ref",
+                "device_public_key_fingerprint": "device_fp",
+                "companion_public_key_fingerprint": "companion_key_fp",
+                "companion_identity_fingerprint": "companion_identity_fp",
+                "credential_version": 2
+            })
+            stale_status, _ = self._request_json("POST", base_url, "/secure-remote/tunnel/rotate", {
+                "protocol_version": 1,
+                "route_id": route_id,
+                "credential_version": 1,
+                "tunnel_credential": "stale"
+            })
+
+        self.assertEqual(bad_status, 400)
+        self.assertEqual(stale_status, 409)
+
     def _patch_paths(self, data_dir):
         app.DATA_DIR = data_dir
         app.REMOTE_TOKEN_FILE = os.path.join(data_dir, "besmart_remote_token")
@@ -322,6 +394,7 @@ class CompanionP03Tests(unittest.TestCase):
         app.PAIRINGS_FILE = os.path.join(data_dir, "besmart_pairings.json")
         app.E2EE_IDENTITY_FILE = os.path.join(data_dir, "besmart_e2ee_identity.json")
         app.E2EE_PAIRINGS_FILE = os.path.join(data_dir, "besmart_e2ee_pairings.json")
+        app.SECURE_REMOTE_BINDING_FILE = os.path.join(data_dir, "besmart_secure_remote_binding.json")
         app.CONSUMED_PACKAGES_FILE = os.path.join(data_dir, "besmart_consumed_setup_packages.json")
 
     def _patch_tailscale(self):

@@ -36,4 +36,19 @@ sleep 3
 
 echo "Starting BeSmart API on port 8765..."
 
-exec python3 /app/app.py
+exec python3 -u - <<'PY'
+import runpy
+import sys
+import traceback
+
+print("[SOSYNC-E2EE-COMPANION] processEntrypoint", flush=True)
+try:
+    runpy.run_path("/app/app.py", run_name="__main__")
+except Exception as error:
+    print(
+        f"[SOSYNC-E2EE-COMPANION] fatalStartupError type={type(error).__name__} message={error}",
+        flush=True
+    )
+    traceback.print_exc()
+    sys.exit(1)
+PY

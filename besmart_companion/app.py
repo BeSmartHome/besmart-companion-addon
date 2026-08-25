@@ -8,15 +8,19 @@ import re
 import select
 import socket
 import subprocess
+import sys
 import threading
 import time
+import traceback
 import uuid
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.serialization import (
     Encoding,
     NoEncryption,
@@ -46,6 +50,7 @@ COMPANION_IDENTITY_FILE = os.path.join(DATA_DIR, "besmart_companion_identity.jso
 PAIRINGS_FILE = os.path.join(DATA_DIR, "besmart_pairings.json")
 E2EE_IDENTITY_FILE = os.path.join(DATA_DIR, "besmart_e2ee_identity.json")
 E2EE_PAIRINGS_FILE = os.path.join(DATA_DIR, "besmart_e2ee_pairings.json")
+SECURE_REMOTE_BINDING_FILE = os.path.join(DATA_DIR, "besmart_secure_remote_binding.json")
 CONSUMED_PACKAGES_FILE = os.path.join(DATA_DIR, "besmart_consumed_setup_packages.json")
 REMOTE_TOKEN_HEADER = "X-BeSmart-Remote-Token"
 HOME_PROFILE_PATH = "/besmart/home-profile"
@@ -58,6 +63,10 @@ SETUP_PACKAGE_ENCRYPTION_ALG = "HPKE-X25519-HKDF-SHA256-CHACHA20-POLY1305"
 SETUP_PACKAGE_SIGNATURE_ALG = "Ed25519"
 RUNTIME_INSTANCE_ID = str(uuid.uuid4())
 RUNTIME_STARTED_AT = datetime.now(timezone.utc).isoformat()
+print(
+    f"[SOSYNC-E2EE-COMPANION] runtimeGlobalsInitialized runtimeInstance={RUNTIME_INSTANCE_ID}",
+    flush=True
+)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -122,6 +131,14 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == "/security/e2ee/pairing-authorization":
             self._handle_e2ee_pairing_authorization_status()
+            return
+
+        if self.path == "/secure-remote/identity":
+            self._handle_secure_remote_identity()
+            return
+
+        if self.path == "/secure-remote/status":
+            self._handle_secure_remote_status()
             return
 
         if self.path == "/tailscale/status":
@@ -330,11 +347,163 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_e2ee_pair()
             return
 
+        if self.path == "/security/e2ee/recover":
+            self._handle_e2ee_recover()
+            return
+
         if self.path == "/security/e2ee/revoke":
             self._handle_e2ee_revoke()
             return
 
+        if self.path == "/secure-remote/provision":
+            self._handle_secure_remote_provision()
+            return
+
+        if self.path == "/secure-remote/tunnel/install":
+            self._handle_secure_remote_tunnel_install()
+            return
+
+        if self.path == "/secure-remote/tunnel/rotate":
+            self._handle_secure_remote_tunnel_rotate()
+            return
+
+        if self.path == "/secure-remote/revoke":
+            self._handle_secure_remote_revoke()
+            return
+
         self._json(404, {"error": "not_found"})
+
+    def _authorize_secure_remote_control_plane(self):
+        if not self._is_authorized_companion_request():
+            self._json(401, {"error": "unauthorized"})
+            return False
+        if not is_local_client(self.client_address[0]):
+            self._json(403, {"error": "local_control_plane_required"})
+            return False
+        return True
+
+    def _handle_secure_remote_identity(self):
+        if not self._authorize_secure_remote_control_plane():
+            return
+        identity = ensure_e2ee_identity()
+        companion_identity = ensure_companion_identity()
+        binding = read_secure_remote_binding()
+        self._json(200, {
+            "protocol_version": 1,
+            "runtime_instance_id": RUNTIME_INSTANCE_ID,
+            "runtime_started_at": RUNTIME_STARTED_AT,
+            "companion_id": companion_identity["companion_id"],
+            "companion_identity_fingerprint": safe_fingerprint(companion_identity["companion_id"]),
+            "companion_public_key_fingerprint": safe_fingerprint(identity["public_key"]),
+            "key_version": identity["key_version"],
+            "secure_remote_configured": bool(binding.get("route_id"))
+        })
+
+    def _handle_secure_remote_status(self):
+        if not self._authorize_secure_remote_control_plane():
+            return
+        self._json(200, secure_remote_public_status())
+
+    def _handle_secure_remote_provision(self):
+        if not self._authorize_secure_remote_control_plane():
+            return
+        try:
+            data = self._read_json_body(64 * 1024)
+        except ValueError as error:
+            self._json(400, {"error": str(error)})
+            return
+        if not is_valid_secure_remote_binding_request(data):
+            self._json(400, {"error": "invalid_secure_remote_binding"})
+            return
+        binding = make_secure_remote_binding(data)
+        write_json_file_secure(SECURE_REMOTE_BINDING_FILE, binding)
+        print(
+            f"[SOSYNC-SECURE-REMOTE-COMPANION] bindingPrepared route={safe_fingerprint(binding.get('route_id'))} credentialVersion={binding.get('credential_version')}",
+            flush=True
+        )
+        self._json(200, secure_remote_public_status(binding))
+
+    def _handle_secure_remote_tunnel_install(self):
+        if not self._authorize_secure_remote_control_plane():
+            return
+        try:
+            data = self._read_json_body(128 * 1024)
+        except ValueError as error:
+            self._json(400, {"error": str(error)})
+            return
+        binding = read_secure_remote_binding()
+        if not binding.get("route_id"):
+            self._json(409, {"error": "secure_remote_not_provisioned"})
+            return
+        if data.get("route_id") != binding.get("route_id"):
+            self._json(403, {"error": "route_mismatch"})
+            return
+        credential_version = int(data.get("credential_version") or binding.get("credential_version") or 0)
+        if credential_version < int(binding.get("credential_version") or 0):
+            self._json(409, {"error": "stale_credential_version"})
+            return
+        # The connector credential is accepted only for local connector runtime use.
+        # It is never returned by identity/status and never logged.
+        credential_present = isinstance(data.get("tunnel_credential"), str) and bool(str(data.get("tunnel_credential")).strip())
+        binding["tunnel_configured"] = credential_present
+        binding["credential_version"] = credential_version
+        binding["tunnel_state"] = "configured" if credential_present else "metadata_only"
+        binding["updated_at"] = iso_now()
+        write_json_file_secure(SECURE_REMOTE_BINDING_FILE, binding)
+        print(
+            f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelInstall route={safe_fingerprint(binding.get('route_id'))} credentialVersion={credential_version} credentialPresent={credential_present}",
+            flush=True
+        )
+        self._json(200, secure_remote_public_status(binding))
+
+    def _handle_secure_remote_tunnel_rotate(self):
+        if not self._authorize_secure_remote_control_plane():
+            return
+        try:
+            data = self._read_json_body(128 * 1024)
+        except ValueError as error:
+            self._json(400, {"error": str(error)})
+            return
+        binding = read_secure_remote_binding()
+        if not binding.get("route_id") or data.get("route_id") != binding.get("route_id"):
+            self._json(403, {"error": "route_mismatch"})
+            return
+        credential_version = int(data.get("credential_version") or 0)
+        if credential_version <= int(binding.get("credential_version") or 0):
+            self._json(409, {"error": "stale_credential_version"})
+            return
+        binding["credential_version"] = credential_version
+        binding["tunnel_configured"] = isinstance(data.get("tunnel_credential"), str) and bool(str(data.get("tunnel_credential")).strip())
+        binding["tunnel_state"] = "configured"
+        binding["updated_at"] = iso_now()
+        write_json_file_secure(SECURE_REMOTE_BINDING_FILE, binding)
+        print(
+            f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelRotate route={safe_fingerprint(binding.get('route_id'))} credentialVersion={credential_version}",
+            flush=True
+        )
+        self._json(200, secure_remote_public_status(binding))
+
+    def _handle_secure_remote_revoke(self):
+        if not self._authorize_secure_remote_control_plane():
+            return
+        try:
+            data = self._read_json_body(16 * 1024)
+        except ValueError as error:
+            self._json(400, {"error": str(error)})
+            return
+        binding = read_secure_remote_binding()
+        if binding.get("route_id") and data.get("route_id") not in (None, binding.get("route_id")):
+            self._json(403, {"error": "route_mismatch"})
+            return
+        binding["status"] = "revoked"
+        binding["revoked_at"] = iso_now()
+        binding["tunnel_state"] = "revoked"
+        write_json_file_secure(SECURE_REMOTE_BINDING_FILE, binding)
+        print(
+            f"[SOSYNC-SECURE-REMOTE-COMPANION] revoked route={safe_fingerprint(binding.get('route_id'))}",
+            flush=True
+        )
+        self._json(200, secure_remote_public_status(binding))
 
     def _handle_e2ee_identity(self):
         identity = ensure_e2ee_identity()
@@ -395,6 +564,86 @@ class Handler(BaseHTTPRequestHandler):
             "companion_public_key": record["companion_public_key"],
             "key_version": record["key_version"],
             "status": record["status"]
+        })
+
+    def _handle_e2ee_recover(self):
+        try:
+            data = self._read_json_body(16 * 1024)
+        except ValueError as error:
+            self._json(400, {"error": str(error)})
+            return
+
+        if data.get("protocol_version") != E2EE_PROTOCOL_VERSION:
+            self._json(426, {"error": "unsupported_protocol_version"})
+            return
+
+        device_id = opaque_e2ee_identifier(data.get("device_id"))
+        device_public_key = normalized_e2ee_public_key(data.get("device_public_key"))
+        client_nonce = str(data.get("client_nonce") or "").strip()
+        device_proof = str(data.get("device_proof") or "").strip()
+        if not device_id or not device_public_key or not client_nonce or not device_proof:
+            self._json(400, {"error": "invalid_recovery_request"})
+            return
+
+        pairings = read_e2ee_pairings()
+        record = pairings.get("devices", {}).get(device_id)
+        recognized = bool(
+            isinstance(record, dict) and
+            record.get("status") == "active" and
+            record.get("device_public_key") == device_public_key
+        )
+        print(
+            f"[SOSYNC-E2EE-RECOVERY] companionPairingLookup recognized={recognized} "
+            f"deviceID={device_id[:8] if device_id else 'none'}",
+            flush=True
+        )
+        if not recognized:
+            self._json(200, {
+                "protocol_version": E2EE_PROTOCOL_VERSION,
+                "recognized": False,
+                "reason": "pairing_not_found"
+            })
+            return
+
+        identity = ensure_e2ee_identity()
+        key = e2ee_recovery_shared_key(identity["private_key"], device_public_key)
+        expected_device_proof = e2ee_recovery_proof(
+            key,
+            "device",
+            device_id,
+            device_public_key,
+            identity["public_key"],
+            client_nonce
+        )
+        device_verified = hmac.compare_digest(device_proof, expected_device_proof)
+        print(f"[SOSYNC-E2EE-RECOVERY] deviceProof verified={device_verified}", flush=True)
+        if not device_verified:
+            self._json(401, {"error": "device_proof_rejected"})
+            return
+
+        companion_nonce = base64url_encode(os.urandom(32))
+        companion_proof = e2ee_recovery_proof(
+            key,
+            "companion",
+            device_id,
+            device_public_key,
+            identity["public_key"],
+            client_nonce,
+            companion_nonce,
+            str(record.get("home_id") or ""),
+            str(record.get("key_version") or identity["key_version"])
+        )
+        self._json(200, {
+            "protocol_version": E2EE_PROTOCOL_VERSION,
+            "recognized": True,
+            "device_id": device_id,
+            "home_id": record["home_id"],
+            "device_public_key": device_public_key,
+            "companion_public_key": identity["public_key"],
+            "key_version": record.get("key_version") or identity["key_version"],
+            "status": record["status"],
+            "companion_nonce": companion_nonce,
+            "companion_proof": companion_proof
         })
 
     def _handle_e2ee_revoke(self):
@@ -1255,6 +1504,15 @@ def read_e2ee_pairings():
     return pairings
 
 
+def log_e2ee_pairing_store_loaded():
+    pairings = read_e2ee_pairings()
+    count = len(pairings.get("devices", {}))
+    print(
+        f"[SOSYNC-E2EE-COMPANION] pairingStoreLoaded count={count} storage=/data/besmart_e2ee_pairings.json",
+        flush=True
+    )
+
+
 def make_e2ee_pairing_record(home_id, device_id, device_public_key, companion_public_key, key_version):
     return {
         "protocol_version": E2EE_PROTOCOL_VERSION,
@@ -1381,6 +1639,36 @@ def clear_e2ee_pairing_authorization():
             changed = True
     if changed:
         write_json_file_secure(ADDON_OPTIONS_FILE, options)
+
+
+def e2ee_recovery_shared_key(companion_private_key, device_public_key):
+    private_key = x25519.X25519PrivateKey.from_private_bytes(base64url_decode(companion_private_key))
+    public_key = x25519.X25519PublicKey.from_public_bytes(base64url_decode(device_public_key))
+    return HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=b"sosync-e2ee-recovery-v1",
+        info=b""
+    ).derive(private_key.exchange(public_key))
+
+
+def e2ee_recovery_proof(key, role, device_id, device_public_key, companion_public_key, client_nonce, companion_nonce=None, home_id=None, key_version=None):
+    parts = [
+        "sosync-e2ee-recovery-v1",
+        str(role or ""),
+        str(device_id or ""),
+        str(device_public_key or ""),
+        str(companion_public_key or ""),
+        str(client_nonce or "")
+    ]
+    if role == "companion":
+        parts.extend([
+            str(companion_nonce or ""),
+            str(home_id or ""),
+            str(key_version or "")
+        ])
+    message = "|".join(parts).encode("utf-8")
+    return base64url_encode(hmac.new(key, message, hashlib.sha256).digest())
 
 
 def opaque_e2ee_identifier(value):
@@ -1556,6 +1844,89 @@ def write_json_file_secure(path, payload):
     os.chmod(path, 0o600)
 
 
+def read_secure_remote_binding():
+    return read_json_file(SECURE_REMOTE_BINDING_FILE, {})
+
+
+def is_opaque_secure_remote_id(value, prefix=None):
+    text = str(value or "").strip()
+    if len(text) < 16 or len(text) > 160:
+        return False
+    if prefix and not text.startswith(prefix):
+        return False
+    if not re.match(r"^[A-Za-z0-9_-]+$", text):
+        return False
+    lowered = text.lower()
+    disallowed = ["@", ".", ":", "/", "\\", "home", "user", "admin", "192", "168", "10-", "172", "local", "duck", "tail", "tsnet", "ha-"]
+    return not any(fragment in lowered for fragment in disallowed)
+
+
+def is_valid_secure_remote_binding_request(data):
+    if not isinstance(data, dict):
+        return False
+    if int(data.get("protocol_version") or 0) != 1:
+        return False
+    if not is_opaque_secure_remote_id(data.get("route_id"), "r_"):
+        return False
+    if not is_opaque_secure_remote_id(data.get("tunnel_binding_id"), "tun_"):
+        return False
+    required_fingerprints = [
+        "home_reference",
+        "device_reference",
+        "device_public_key_fingerprint",
+        "companion_public_key_fingerprint",
+        "companion_identity_fingerprint"
+    ]
+    for key in required_fingerprints:
+        value = str(data.get(key) or "").strip()
+        if not value or len(value) > 256:
+            return False
+    try:
+        credential_version = int(data.get("credential_version") or 0)
+    except (TypeError, ValueError):
+        return False
+    return credential_version >= 1
+
+
+def make_secure_remote_binding(data):
+    now = iso_now()
+    return {
+        "protocol_version": 1,
+        "route_id": str(data.get("route_id")).strip(),
+        "tunnel_binding_id": str(data.get("tunnel_binding_id")).strip(),
+        "home_reference": str(data.get("home_reference")).strip(),
+        "device_reference": str(data.get("device_reference")).strip(),
+        "device_public_key_fingerprint": str(data.get("device_public_key_fingerprint")).strip(),
+        "companion_public_key_fingerprint": str(data.get("companion_public_key_fingerprint")).strip(),
+        "companion_identity_fingerprint": str(data.get("companion_identity_fingerprint")).strip(),
+        "credential_version": int(data.get("credential_version") or 1),
+        "status": "control_plane_bound",
+        "tunnel_configured": False,
+        "tunnel_state": "pending",
+        "created_at": now,
+        "updated_at": now,
+        "revoked_at": None
+    }
+
+
+def secure_remote_public_status(binding=None):
+    binding = binding if isinstance(binding, dict) else read_secure_remote_binding()
+    configured = bool(binding.get("route_id")) and binding.get("status") != "revoked"
+    return {
+        "protocol_version": 1,
+        "configured": configured,
+        "status": binding.get("status") or "unconfigured",
+        "route_id_fingerprint": safe_fingerprint(binding.get("route_id")),
+        "tunnel_binding_fingerprint": safe_fingerprint(binding.get("tunnel_binding_id")),
+        "credential_version": int(binding.get("credential_version") or 0),
+        "tunnel_configured": bool(binding.get("tunnel_configured")),
+        "tunnel_state": binding.get("tunnel_state") or "unconfigured",
+        "last_healthy_at": binding.get("last_healthy_at"),
+        "updated_at": binding.get("updated_at"),
+        "revoked_at": binding.get("revoked_at")
+    }
+
+
 def base64url_encode(value):
     return base64.urlsafe_b64encode(value).decode("utf-8").rstrip("=")
 
@@ -1572,6 +1943,12 @@ def sha256_base64url(value):
 
 def remote_token_fingerprint(remote_token):
     return sha256_base64url(str(remote_token).encode("utf-8"))[:16]
+
+
+def safe_fingerprint(value):
+    if not value:
+        return "none"
+    return sha256_base64url(str(value).encode("utf-8"))[:16]
 
 
 def iso_now():
@@ -1704,11 +2081,26 @@ def tailscale_dns_name(status_data):
     return dns_name or None
 
 
-if __name__ == "__main__":
+def main():
     print(f"[SOSYNC-E2EE-COMPANION] runtimeStarted runtimeInstance={RUNTIME_INSTANCE_ID}", flush=True)
+    log_e2ee_pairing_store_loaded()
     log_pairing_authorization_loaded()
+    print("[SOSYNC-E2EE-COMPANION] serverConstructionStarted", flush=True)
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"BeSmart Companion listening on port {PORT}")
     print(f"[SOSYNC-E2EE-COMPANION] runtimeListening runtimeInstance={RUNTIME_INSTANCE_ID} port={PORT}", flush=True)
     print("[SOSYNC-E2EE-COMPANION] routesRegistered identity=true pairingAuthorization=true pair=true revoke=true protocol=1", flush=True)
+    print("[SOSYNC-SECURE-REMOTE-COMPANION] routesRegistered identity=true status=true provision=true tunnelInstall=true tunnelRotate=true revoke=true dataPlane=false", flush=True)
     server.serve_forever()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except BaseException as error:
+        print(
+            f"[SOSYNC-E2EE-COMPANION] fatalStartupError type={type(error).__name__} message={error}",
+            flush=True
+        )
+        traceback.print_exc()
+        sys.exit(1)
