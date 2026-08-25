@@ -150,12 +150,13 @@ class CompanionP03Tests(unittest.TestCase):
         dockerfile = (addon_root / "Dockerfile").read_text(encoding="utf-8")
         runtime = (addon_root / "app.py").read_text(encoding="utf-8")
 
-        self.assertIn('version: "1.0.13"', config)
+        self.assertIn('version: "1.0.14"', config)
         self.assertIn("e2ee_pairing_authorization", config)
         self.assertIn("COPY app.py /app/app.py", dockerfile)
         self.assertIn("CLOUDFLARED_VERSION=2026.8.2", dockerfile)
         self.assertIn("BESMART_CLOUDFLARED_BIN=/usr/local/bin/cloudflared", dockerfile)
-        self.assertIn("SOSYNC_COMPANION_BUILD=1.0.13-secure-remote-tunnel-v1", dockerfile)
+        self.assertIn("SOSYNC_COMPANION_VERSION=1.0.14", dockerfile)
+        self.assertIn("SOSYNC_COMPANION_BUILD=1.0.14-secure-remote-tunnel-state-v2", dockerfile)
         self.assertIn("/usr/local/bin/cloudflared --version", dockerfile)
         self.assertIn('self.path == "/security/e2ee/identity"', runtime)
         self.assertIn('self.path == "/security/e2ee/pair"', runtime)
@@ -163,7 +164,7 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertIn("tunnelCredentialInstalled", runtime)
         self.assertIn("tunnelProcessStarted", runtime)
         self.assertIn("tunnelProcessFailed", runtime)
-        self.assertIn("1.0.13-secure-remote-tunnel-v1", runtime)
+        self.assertIn("1.0.14-secure-remote-tunnel-state-v2", runtime)
 
     def test_health_and_identity_expose_runtime_build_marker(self):
         with self._server() as base_url:
@@ -172,8 +173,11 @@ class CompanionP03Tests(unittest.TestCase):
 
         self.assertEqual(health_status, 200)
         self.assertEqual(identity_status, 200)
-        self.assertEqual(health["build"], "1.0.13-secure-remote-tunnel-v1")
-        self.assertEqual(identity["build"], "1.0.13-secure-remote-tunnel-v1")
+        self.assertEqual(health["build"], "1.0.14-secure-remote-tunnel-state-v2")
+        self.assertEqual(identity["build"], "1.0.14-secure-remote-tunnel-state-v2")
+        self.assertEqual(health["companion_version"], "1.0.14")
+        self.assertIn("cloudflared_available", health)
+        self.assertIn("cloudflared_running", health)
 
     def test_pairing_consume_hashes_secret_signs_receipt_and_rejects_replay(self):
         identity = app.ensure_companion_identity()
@@ -364,6 +368,8 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertTrue(provision["configured"])
         self.assertTrue(install["tunnel_configured"])
         self.assertTrue(status["tunnel_configured"])
+        self.assertEqual(install["tunnel_state"], "running")
+        self.assertTrue(install["cloudflared_running"])
         self.assertEqual(status["credential_version"], 1)
         serialized = json.dumps(status)
         self.assertNotIn("secret-tunnel-credential", serialized)
@@ -402,6 +408,8 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertFalse(install["tunnel_configured"])
         self.assertFalse(status["tunnel_configured"])
         self.assertEqual(install["tunnel_state"], "failed")
+        self.assertEqual(install["failure_stage"], "binaryLookup")
+        self.assertEqual(install["failure_reason"], "cloudflaredMissing")
         serialized = json.dumps(install) + json.dumps(status)
         self.assertNotIn("secret-tunnel-credential", serialized)
         self.assertNotIn("tunnel_credential", serialized)
@@ -449,6 +457,122 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertEqual(install_status, 503)
         self.assertFalse(install["tunnel_configured"])
         self.assertEqual(install["tunnel_state"], "failed")
+        self.assertEqual(install["failure_stage"], "immediateExit")
+
+    def test_secure_remote_tunnel_install_fails_closed_when_credential_missing(self):
+        route_id = "r_abcdefghijklmnopqrstuvwxyz123456"
+        tunnel_id = "tun_abcdefghijklmnopqrstuvwxyz123456"
+        with self._server() as base_url:
+            provision_status, _ = self._request_json("POST", base_url, "/secure-remote/provision", {
+                "protocol_version": 1,
+                "route_id": route_id,
+                "tunnel_binding_id": tunnel_id,
+                "home_reference": "home_ref",
+                "device_reference": "device_ref",
+                "device_public_key_fingerprint": "device_fp",
+                "companion_public_key_fingerprint": "companion_key_fp",
+                "companion_identity_fingerprint": "companion_identity_fp",
+                "credential_version": 1
+            })
+            install_status, install = self._request_json("POST", base_url, "/secure-remote/tunnel/install", {
+                "protocol_version": 1,
+                "route_id": route_id,
+                "credential_version": 1
+            })
+
+        self.assertEqual(provision_status, 200)
+        self.assertEqual(install_status, 503)
+        self.assertFalse(install["tunnel_configured"])
+        self.assertFalse(install["cloudflared_running"])
+        self.assertEqual(install["tunnel_state"], "failed")
+        self.assertEqual(install["failure_stage"], "credential")
+        self.assertEqual(install["failure_reason"], "credentialMissing")
+
+    def test_secure_remote_tunnel_install_fails_closed_when_process_spawn_raises(self):
+        route_id = "r_abcdefghijklmnopqrstuvwxyz123456"
+        tunnel_id = "tun_abcdefghijklmnopqrstuvwxyz123456"
+        self._patch_cloudflared_start(raise_start=True)
+        try:
+            with self._server() as base_url:
+                provision_status, _ = self._request_json("POST", base_url, "/secure-remote/provision", {
+                    "protocol_version": 1,
+                    "route_id": route_id,
+                    "tunnel_binding_id": tunnel_id,
+                    "home_reference": "home_ref",
+                    "device_reference": "device_ref",
+                    "device_public_key_fingerprint": "device_fp",
+                    "companion_public_key_fingerprint": "companion_key_fp",
+                    "companion_identity_fingerprint": "companion_identity_fp",
+                    "credential_version": 1
+                })
+                install_status, install = self._request_json("POST", base_url, "/secure-remote/tunnel/install", {
+                    "protocol_version": 1,
+                    "route_id": route_id,
+                    "credential_version": 1,
+                    "tunnel_credential": "secret-tunnel-credential"
+                })
+        finally:
+            self._restore_cloudflared_start()
+
+        self.assertEqual(provision_status, 200)
+        self.assertEqual(install_status, 503)
+        self.assertFalse(install["tunnel_configured"])
+        self.assertEqual(install["tunnel_state"], "failed")
+        self.assertEqual(install["failure_stage"], "processStart")
+
+    def test_secure_remote_status_corrects_stale_configured_without_process(self):
+        binding = app.make_secure_remote_binding({
+            "protocol_version": 1,
+            "route_id": "r_abcdefghijklmnopqrstuvwxyz123456",
+            "tunnel_binding_id": "tun_abcdefghijklmnopqrstuvwxyz123456",
+            "home_reference": "home_ref",
+            "device_reference": "device_ref",
+            "device_public_key_fingerprint": "device_fp",
+            "companion_public_key_fingerprint": "companion_key_fp",
+            "companion_identity_fingerprint": "companion_identity_fp",
+            "credential_version": 1
+        })
+        binding["tunnel_configured"] = True
+        binding["tunnel_state"] = "configured"
+        app.write_json_file_secure(app.SECURE_REMOTE_BINDING_FILE, binding)
+        app.SECURE_REMOTE_TUNNEL_PROCESS = None
+
+        status = app.secure_remote_public_status()
+
+        self.assertFalse(status["tunnel_configured"])
+        self.assertFalse(status["cloudflared_running"])
+        self.assertEqual(status["tunnel_state"], "notConfigured")
+
+    def test_secure_remote_tunnel_install_uses_worker_connector_token_mode(self):
+        route_id = "r_abcdefghijklmnopqrstuvwxyz123456"
+        tunnel_id = "tun_abcdefghijklmnopqrstuvwxyz123456"
+        captured = {}
+        self._patch_cloudflared_start(running=True, captured=captured)
+        try:
+            with self._server() as base_url:
+                self._request_json("POST", base_url, "/secure-remote/provision", {
+                    "protocol_version": 1,
+                    "route_id": route_id,
+                    "tunnel_binding_id": tunnel_id,
+                    "home_reference": "home_ref",
+                    "device_reference": "device_ref",
+                    "device_public_key_fingerprint": "device_fp",
+                    "companion_public_key_fingerprint": "companion_key_fp",
+                    "companion_identity_fingerprint": "companion_identity_fp",
+                    "credential_version": 1
+                })
+                install_status, install = self._request_json("POST", base_url, "/secure-remote/tunnel/install", {
+                    "protocol_version": 1,
+                    "route_id": route_id,
+                    "credential_version": 1,
+                    "tunnel_credential": "secret-tunnel-credential"
+                })
+        finally:
+            self._restore_cloudflared_start()
+
+        self.assertEqual(install_status, 200)
+        self.assertEqual(install["tunnel_state"], "running")
+        self.assertEqual(captured["args"][0][-2:], ["--token", "secret-tunnel-credential"])
 
     def test_secure_remote_rejects_semantic_route_and_stale_rotation(self):
         route_id = "r_abcdefghijklmnopqrstuvwxyz123456"
@@ -506,13 +630,17 @@ class CompanionP03Tests(unittest.TestCase):
         app.run_tailscale_up = lambda auth_key, hostname, enable_funnel: {"ok": True}
         app.enable_tailscale_funnel = lambda target: {"ok": True}
 
-    def _patch_cloudflared_start(self, running=False, missing=False, stderr_message=""):
+    def _patch_cloudflared_start(self, running=False, missing=False, stderr_message="", captured=None, raise_start=False):
         self._original_shutil_which = app.shutil.which
         self._original_popen = app.subprocess.Popen
+        self._original_run = app.subprocess.run
         app.SECURE_REMOTE_TUNNEL_PROCESS = None
         app.shutil.which = lambda binary: None if missing else "/usr/local/bin/cloudflared"
+        app.subprocess.run = lambda *args, **kwargs: type("Completed", (), {"returncode": 0, "stdout": "cloudflared version 2026.8.2", "stderr": ""})()
 
         class FakeProcess:
+            pid = 1234
+
             def poll(self):
                 return None if running else 1
 
@@ -526,6 +654,10 @@ class CompanionP03Tests(unittest.TestCase):
                 return None
 
         def fake_popen(*args, **kwargs):
+            if raise_start:
+                raise OSError("spawn denied")
+            if captured is not None:
+                captured["args"] = args
             stderr = kwargs.get("stderr")
             if stderr_message and stderr is not None:
                 stderr.write(stderr_message.encode("utf-8"))
@@ -540,6 +672,8 @@ class CompanionP03Tests(unittest.TestCase):
             app.shutil.which = self._original_shutil_which
         if hasattr(self, "_original_popen"):
             app.subprocess.Popen = self._original_popen
+        if hasattr(self, "_original_run"):
+            app.subprocess.run = self._original_run
 
     def _write_options(self, value):
         Path(app.ADDON_OPTIONS_FILE).write_text(json.dumps(value), encoding="utf-8")
