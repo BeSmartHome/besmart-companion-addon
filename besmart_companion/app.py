@@ -66,8 +66,8 @@ SETUP_PACKAGE_ENCRYPTION_ALG = "HPKE-X25519-HKDF-SHA256-CHACHA20-POLY1305"
 SETUP_PACKAGE_SIGNATURE_ALG = "Ed25519"
 RUNTIME_INSTANCE_ID = str(uuid.uuid4())
 RUNTIME_STARTED_AT = datetime.now(timezone.utc).isoformat()
-SOSYNC_COMPANION_VERSION = os.environ.get("SOSYNC_COMPANION_VERSION", "1.0.20")
-SOSYNC_COMPANION_BUILD = os.environ.get("SOSYNC_COMPANION_BUILD", "1.0.20-secure-remote-token-format-v1")
+SOSYNC_COMPANION_VERSION = os.environ.get("SOSYNC_COMPANION_VERSION", "1.0.21")
+SOSYNC_COMPANION_BUILD = os.environ.get("SOSYNC_COMPANION_BUILD", "1.0.21-secure-remote-method-parity-v1")
 SECURE_REMOTE_TUNNEL_CONFIRMATION_SECONDS = float(os.environ.get("SOSYNC_TUNNEL_CONFIRMATION_SECONDS", "1.0"))
 SECURE_REMOTE_TUNNEL_LOCK = threading.Lock()
 SECURE_REMOTE_TUNNEL_PROCESS = None
@@ -105,12 +105,7 @@ class Handler(BaseHTTPRequestHandler):
             self._proxy_signed_home_assistant()
             return
 
-        if request_path in ("/secure-remote/data-plane/health", "/secure-remote/data-plane/health/"):
-            self._handle_secure_remote_dataplane_health()
-            return
-
-        if request_path.startswith("/secure-remote/data-plane/ha"):
-            self._proxy_secure_remote_home_assistant()
+        if self._handle_secure_remote_dataplane_request(request_path):
             return
 
         if self.path.startswith(REMOTE_PREFIX):
@@ -216,6 +211,9 @@ class Handler(BaseHTTPRequestHandler):
             self._proxy_signed_home_assistant()
             return
 
+        if self._handle_secure_remote_dataplane_request(urlparse(self.path).path):
+            return
+
         if self.path == HOME_PROFILE_PATH:
             self._handle_home_profile_put()
             return
@@ -234,6 +232,9 @@ class Handler(BaseHTTPRequestHandler):
             self._proxy_signed_home_assistant()
             return
 
+        if self._handle_secure_remote_dataplane_request(urlparse(self.path).path):
+            return
+
         if self.path.startswith(REMOTE_PREFIX):
             self._proxy_home_assistant()
             return
@@ -246,6 +247,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path.startswith(SIGNED_REMOTE_PREFIX):
             self._proxy_signed_home_assistant()
+            return
+
+        if self._handle_secure_remote_dataplane_request(urlparse(self.path).path):
             return
 
         if self.path.startswith(REMOTE_PREFIX):
@@ -413,8 +417,7 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_secure_remote_tunnel_rotate()
             return
 
-        if self.path.startswith("/secure-remote/data-plane/ha"):
-            self._proxy_secure_remote_home_assistant()
+        if self._handle_secure_remote_dataplane_request(urlparse(self.path).path):
             return
 
         if self.path == "/secure-remote/revoke":
@@ -422,6 +425,17 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         self._json(404, {"error": "not_found"})
+
+    def _handle_secure_remote_dataplane_request(self, request_path):
+        if request_path in ("/secure-remote/data-plane/health", "/secure-remote/data-plane/health/"):
+            self._handle_secure_remote_dataplane_health()
+            return True
+
+        if request_path.startswith("/secure-remote/data-plane/ha"):
+            self._proxy_secure_remote_home_assistant()
+            return True
+
+        return False
 
     def _authorize_secure_remote_control_plane(self):
         if not self._is_authorized_companion_request():
@@ -600,6 +614,10 @@ class Handler(BaseHTTPRequestHandler):
     def _authorize_secure_remote_dataplane(self):
         binding = read_secure_remote_binding()
         if not binding.get("route_id") or binding.get("status") == "revoked":
+            print(
+                "[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionOriginValidation routeValidationPassed=false originTokenValidationPassed=false reason=notBound",
+                flush=True
+            )
             self._json(403, {"error": "secure_remote_not_bound"})
             return None
         route = self.headers.get("X-SoSync-Secure-Remote-Route")
@@ -607,6 +625,10 @@ class Handler(BaseHTTPRequestHandler):
         stored_token = str(binding.get("origin_access_token") or "").strip()
         route_ok = hmac.compare_digest(str(route or ""), str(binding.get("tunnel_binding_id") or ""))
         token_ok = bool(stored_token) and hmac.compare_digest(str(token or ""), stored_token)
+        print(
+            f"[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionOriginValidation route={safe_fingerprint(binding.get('route_id'))} tunnelBinding={safe_fingerprint(binding.get('tunnel_binding_id'))} routeValidationPassed={route_ok} originTokenValidationPassed={token_ok}",
+            flush=True
+        )
         if not route_ok or not token_ok:
             self._json(401, {"error": "unauthorized"}, headers={
                 "X-SoSync-Origin": "companion",
@@ -658,12 +680,23 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def _proxy_secure_remote_home_assistant(self):
+        parsed_remote_path = urlparse(self.path)
+        ha_path = parsed_remote_path.path[len("/secure-remote/data-plane/ha"):] or "/"
+        print(
+            f"[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionHAHandlerReached method={self.command} pathClass={ha_path_class_for_log(ha_path)} websocketUpgradeAttempted={is_websocket_upgrade(self.headers)}",
+            flush=True
+        )
         binding = self._authorize_secure_remote_dataplane()
         if not binding:
             return
-        parsed_remote_path = urlparse(self.path)
-        ha_path = parsed_remote_path.path[len("/secure-remote/data-plane/ha"):] or "/"
-        if not is_allowed_ha_path(ha_path) and not (ha_path == "/auth/token" and self.command == "POST"):
+        is_oauth_token_refresh = ha_path == "/auth/token" and self.command == "POST"
+        allowed_ha_path = is_allowed_ha_path(ha_path)
+        allowed = allowed_ha_path or is_oauth_token_refresh
+        print(
+            f"[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionHAPathPolicy method={self.command} pathClass={ha_path_class_for_log(ha_path)} isAllowedHAPath={allowed_ha_path} haAuthEndpointReached={is_oauth_token_refresh} allowed={allowed}",
+            flush=True
+        )
+        if not allowed:
             self._json(403, {"error": "route_not_allowed"})
             return
         print(
@@ -1118,6 +1151,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _proxy_home_assistant_path(self, ha_path, query):
         if is_websocket_upgrade(self.headers):
+            print(
+                f"[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionWebSocketUpgradeAttempted method={self.command} pathClass={ha_path_class_for_log(ha_path)}",
+                flush=True
+            )
             self._proxy_home_assistant_websocket(ha_path, query)
             return
 
@@ -1137,6 +1174,10 @@ class Handler(BaseHTTPRequestHandler):
 
         print(
             f"[REMOTE-HTTP] method={self.command} route=ha upstreamPath={sanitize_ha_path_for_log(ha_path)}",
+            flush=True
+        )
+        print(
+            f"[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionUpstreamHARequestStarted method={self.command} pathClass={ha_path_class_for_log(ha_path)} haAuthEndpointReached={ha_path == '/auth/token'}",
             flush=True
         )
 
@@ -1160,6 +1201,10 @@ class Handler(BaseHTTPRequestHandler):
                     f"[REMOTE-HTTP] method={self.command} upstreamStatus={response.status} upstreamPath={sanitize_ha_path_for_log(ha_path)}",
                     flush=True
                 )
+                print(
+                    f"[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionUpstreamHAResponse method={self.command} pathClass={ha_path_class_for_log(ha_path)} upstreamResponseStatus={response.status}",
+                    flush=True
+                )
         except urllib.error.HTTPError as error:
             response_body = error.read()
             self.send_response(error.code)
@@ -1170,6 +1215,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(response_body)
             print(
                 f"[REMOTE-HTTP] method={self.command} upstreamStatus={error.code} upstreamPath={sanitize_ha_path_for_log(ha_path)}",
+                flush=True
+            )
+            print(
+                f"[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionUpstreamHAResponse method={self.command} pathClass={ha_path_class_for_log(ha_path)} upstreamResponseStatus={error.code}",
                 flush=True
             )
         except BrokenPipeError:
@@ -1190,6 +1239,10 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             print(f"[REMOTE-WS] proxy upstreamPath={ha_path}", flush=True)
+            print(
+                f"[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionWebSocketUpstreamStarted pathClass={ha_path_class_for_log(ha_path)}",
+                flush=True
+            )
             with socket.create_connection((upstream_host, upstream_port), timeout=10) as upstream_socket:
                 upstream_socket.settimeout(None)
                 self.connection.settimeout(None)
@@ -1208,6 +1261,10 @@ class Handler(BaseHTTPRequestHandler):
                     return
 
                 print("[REMOTE-WS] upgradeAccepted", flush=True)
+                print(
+                    f"[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionWebSocketUpstreamConnected pathClass={ha_path_class_for_log(ha_path)} websocketUpgradeAccepted=true",
+                    flush=True
+                )
                 tunnel_sockets(self.connection, upstream_socket)
                 print("WebSocket proxy closed", flush=True)
         except Exception as error:
@@ -1370,6 +1427,18 @@ def sanitize_signed_path(path):
 
 def sanitize_ha_path_for_log(path):
     return re.sub(r"/[A-Za-z0-9_-]{12,}", "/<id>", path)
+
+
+def ha_path_class_for_log(path):
+    if path == "/api/websocket":
+        return "haWebSocket"
+    if path == "/auth/token":
+        return "haAuthToken"
+    if path in ("/api", "/api/"):
+        return "haApiRoot"
+    if path.startswith("/api/"):
+        return "haApi"
+    return "other"
 
 
 def is_websocket_upgrade(headers):

@@ -1,11 +1,13 @@
 import json
 import os
+import contextlib
+import io
 import tempfile
 import threading
 import time
 import unittest
 from http.client import HTTPConnection
-from http.server import ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
@@ -150,13 +152,13 @@ class CompanionP03Tests(unittest.TestCase):
         dockerfile = (addon_root / "Dockerfile").read_text(encoding="utf-8")
         runtime = (addon_root / "app.py").read_text(encoding="utf-8")
 
-        self.assertIn('version: "1.0.20"', config)
+        self.assertIn('version: "1.0.21"', config)
         self.assertIn("e2ee_pairing_authorization", config)
         self.assertIn("COPY app.py /app/app.py", dockerfile)
         self.assertIn("CLOUDFLARED_VERSION=2026.8.2", dockerfile)
         self.assertIn("BESMART_CLOUDFLARED_BIN=/usr/local/bin/cloudflared", dockerfile)
-        self.assertIn("SOSYNC_COMPANION_VERSION=1.0.20", dockerfile)
-        self.assertIn("SOSYNC_COMPANION_BUILD=1.0.20-secure-remote-token-format-v1", dockerfile)
+        self.assertIn("SOSYNC_COMPANION_VERSION=1.0.21", dockerfile)
+        self.assertIn("SOSYNC_COMPANION_BUILD=1.0.21-secure-remote-method-parity-v1", dockerfile)
         self.assertIn("/usr/local/bin/cloudflared --version", dockerfile)
         self.assertIn('self.path == "/security/e2ee/identity"', runtime)
         self.assertIn('self.path == "/security/e2ee/pair"', runtime)
@@ -164,7 +166,7 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertIn("tunnelCredentialInstalled", runtime)
         self.assertIn("tunnelProcessStarted", runtime)
         self.assertIn("tunnelProcessFailed", runtime)
-        self.assertIn("1.0.20-secure-remote-token-format-v1", runtime)
+        self.assertIn("1.0.21-secure-remote-method-parity-v1", runtime)
 
     def test_health_and_identity_expose_runtime_build_marker(self):
         with self._server() as base_url:
@@ -173,9 +175,9 @@ class CompanionP03Tests(unittest.TestCase):
 
         self.assertEqual(health_status, 200)
         self.assertEqual(identity_status, 200)
-        self.assertEqual(health["build"], "1.0.20-secure-remote-token-format-v1")
-        self.assertEqual(identity["build"], "1.0.20-secure-remote-token-format-v1")
-        self.assertEqual(health["companion_version"], "1.0.20")
+        self.assertEqual(health["build"], "1.0.21-secure-remote-method-parity-v1")
+        self.assertEqual(identity["build"], "1.0.21-secure-remote-method-parity-v1")
+        self.assertEqual(health["companion_version"], "1.0.21")
         self.assertIn("cloudflared_available", health)
         self.assertIn("cloudflared_running", health)
 
@@ -456,6 +458,180 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertEqual(missing_body["error"], "not_found")
         self.assertEqual(missing_headers.get("X-SoSync-Origin"), "companion")
         self.assertEqual(missing_headers.get("X-SoSync-Route"), "fallback")
+
+    def test_secure_remote_dataplane_diagnostics_cover_auth_allowlist_and_upstream_safely(self):
+        route_id = "r_abcdefghijklmnopqrstuvwxyz123456"
+        tunnel_id = "tun_abcdefghijklmnopqrstuvwxyz123456"
+        origin_token = "orig_abcdefghijklmnopqrstuvwxyz123456"
+        upstream_requests = []
+
+        class FakeHAHandler(BaseHTTPRequestHandler):
+            def _record_and_respond(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length) if length > 0 else b""
+                upstream_requests.append({
+                    "method": self.command,
+                    "path": self.path,
+                    "body": body.decode("utf-8"),
+                    "authorization": self.headers.get("Authorization")
+                })
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"ok": true}')
+
+            def do_GET(self):
+                if self.headers.get("Upgrade", "").lower() == "websocket":
+                    upstream_requests.append({
+                        "method": "GET",
+                        "path": self.path,
+                        "body": "",
+                        "authorization": self.headers.get("Authorization"),
+                        "upgrade": "websocket"
+                    })
+                    self.send_response(101, "Switching Protocols")
+                    self.send_header("Upgrade", "websocket")
+                    self.send_header("Connection", "Upgrade")
+                    self.send_header("Sec-WebSocket-Accept", "diagnostic")
+                    self.end_headers()
+                    return
+                self._record_and_respond()
+
+            def do_POST(self):
+                self._record_and_respond()
+
+            def do_PUT(self):
+                self._record_and_respond()
+
+            def do_PATCH(self):
+                self._record_and_respond()
+
+            def do_DELETE(self):
+                self._record_and_respond()
+
+            def log_message(self, format, *args):
+                return
+
+        ha_server = ThreadingHTTPServer(("127.0.0.1", 0), FakeHAHandler)
+        ha_thread = threading.Thread(target=ha_server.serve_forever, daemon=True)
+        ha_thread.start()
+        host, port = ha_server.server_address
+        original_read_ha_upstream = app.read_ha_upstream
+        app.read_ha_upstream = lambda: f"http://{host}:{port}"
+        self._patch_cloudflared_start(running=True)
+        try:
+            with self._server() as base_url:
+                self._request_json("POST", base_url, "/secure-remote/provision", {
+                    "protocol_version": 1,
+                    "route_id": route_id,
+                    "tunnel_binding_id": tunnel_id,
+                    "home_reference": "home_ref",
+                    "device_reference": "device_ref",
+                    "device_public_key_fingerprint": "device_fp",
+                    "companion_public_key_fingerprint": "companion_key_fp",
+                    "companion_identity_fingerprint": "companion_identity_fp",
+                    "credential_version": 1,
+                    "origin_access_token": origin_token
+                })
+                self._request_json("POST", base_url, "/secure-remote/tunnel/install", {
+                    "protocol_version": 1,
+                    "route_id": route_id,
+                    "credential_version": 1,
+                    "tunnel_credential": "secret-tunnel-credential"
+                })
+                headers = {
+                    "X-SoSync-Secure-Remote-Route": tunnel_id,
+                    "X-SoSync-Secure-Remote-Origin-Token": origin_token,
+                    "Authorization": "Bearer ha_access_token_should_not_log"
+                }
+                captured = io.StringIO()
+                with contextlib.redirect_stdout(captured):
+                    get_status, _, _ = self._request_json_response("GET", base_url, "/secure-remote/data-plane/ha/api/states", headers=headers)
+                    post_status, _, _ = self._request_json_response("POST", base_url, "/secure-remote/data-plane/ha/auth/token", {"grant_type": "refresh_token", "refresh_token": "raw_refresh_token"}, headers=headers)
+                    put_status, _, _ = self._request_json_response("PUT", base_url, "/secure-remote/data-plane/ha/api/states/light.test?source=diagnostic", {"state": "on"}, headers=headers)
+                    patch_status, _, _ = self._request_json_response("PATCH", base_url, "/secure-remote/data-plane/ha/api/config/config_entries/entry/abc123?source=diagnostic", {"disabled_by": None}, headers=headers)
+                    delete_status, _, _ = self._request_json_response("DELETE", base_url, "/secure-remote/data-plane/ha/api/config/automation/config/automation.test?source=diagnostic", {"delete": True}, headers=headers)
+                    unauth_put_status, unauth_put_body, _ = self._request_json_response("PUT", base_url, "/secure-remote/data-plane/ha/api/states/light.test", {"state": "off"})
+                    denied_status, denied_body, _ = self._request_json_response("GET", base_url, "/secure-remote/data-plane/ha/not-allowed", headers=headers)
+                    denied_delete_status, denied_delete_body, _ = self._request_json_response("DELETE", base_url, "/secure-remote/data-plane/ha/not-allowed", headers=headers)
+                    control_plane_put_status, control_plane_put_body, _ = self._request_json_response("PUT", base_url, "/secure-remote/provision", {"protocol_version": 1}, headers=headers)
+                    ws_status = self._request_status("GET", base_url, "/secure-remote/data-plane/ha/api/websocket", headers={
+                        **headers,
+                        "Connection": "Upgrade",
+                        "Upgrade": "websocket",
+                        "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==",
+                        "Sec-WebSocket-Version": "13"
+                    })
+        finally:
+            app.read_ha_upstream = original_read_ha_upstream
+            self._restore_cloudflared_start()
+            ha_server.shutdown()
+            ha_thread.join(timeout=2)
+
+        logs = captured.getvalue()
+        self.assertEqual(get_status, 200)
+        self.assertEqual(post_status, 200)
+        self.assertEqual(put_status, 200)
+        self.assertEqual(patch_status, 200)
+        self.assertEqual(delete_status, 200)
+        self.assertEqual(ws_status, 101)
+        self.assertEqual(unauth_put_status, 401)
+        self.assertEqual(unauth_put_body["error"], "unauthorized")
+        self.assertEqual(denied_status, 403)
+        self.assertEqual(denied_body["error"], "route_not_allowed")
+        self.assertEqual(denied_delete_status, 403)
+        self.assertEqual(denied_delete_body["error"], "route_not_allowed")
+        self.assertEqual(control_plane_put_status, 404)
+        self.assertEqual(control_plane_put_body["error"], "not_found")
+        self.assertIn({
+            "method": "PUT",
+            "path": "/api/states/light.test?source=diagnostic",
+            "body": '{"state": "on"}',
+            "authorization": "Bearer ha_access_token_should_not_log"
+        }, upstream_requests)
+        self.assertIn({
+            "method": "PATCH",
+            "path": "/api/config/config_entries/entry/abc123?source=diagnostic",
+            "body": '{"disabled_by": null}',
+            "authorization": "Bearer ha_access_token_should_not_log"
+        }, upstream_requests)
+        self.assertIn({
+            "method": "DELETE",
+            "path": "/api/config/automation/config/automation.test?source=diagnostic",
+            "body": '{"delete": true}',
+            "authorization": "Bearer ha_access_token_should_not_log"
+        }, upstream_requests)
+        self.assertIn({
+            "method": "GET",
+            "path": "/api/websocket",
+            "body": "",
+            "authorization": None,
+            "upgrade": "websocket"
+        }, upstream_requests)
+        self.assertIn("event=companionHAHandlerReached method=GET pathClass=haApi", logs)
+        self.assertIn("event=companionOriginValidation", logs)
+        self.assertIn("routeValidationPassed=True", logs)
+        self.assertIn("originTokenValidationPassed=True", logs)
+        self.assertIn("event=companionHAPathPolicy method=GET pathClass=haApi isAllowedHAPath=True", logs)
+        self.assertIn("event=companionUpstreamHARequestStarted method=GET pathClass=haApi haAuthEndpointReached=False", logs)
+        self.assertIn("event=companionUpstreamHAResponse method=GET pathClass=haApi upstreamResponseStatus=200", logs)
+        self.assertIn("event=companionHAHandlerReached method=PUT pathClass=haApi", logs)
+        self.assertIn("event=companionHAHandlerReached method=PATCH pathClass=haApi", logs)
+        self.assertIn("event=companionHAHandlerReached method=DELETE pathClass=haApi", logs)
+        self.assertIn("event=companionUpstreamHARequestStarted method=PUT pathClass=haApi haAuthEndpointReached=False", logs)
+        self.assertIn("event=companionUpstreamHARequestStarted method=PATCH pathClass=haApi haAuthEndpointReached=False", logs)
+        self.assertIn("event=companionUpstreamHARequestStarted method=DELETE pathClass=haApi haAuthEndpointReached=False", logs)
+        self.assertIn("event=companionWebSocketUpgradeAttempted method=GET pathClass=haWebSocket", logs)
+        self.assertIn("event=companionWebSocketUpstreamConnected pathClass=haWebSocket websocketUpgradeAccepted=true", logs)
+        self.assertIn("event=companionHAPathPolicy method=POST pathClass=haAuthToken isAllowedHAPath=False haAuthEndpointReached=True allowed=True", logs)
+        self.assertIn("event=companionUpstreamHARequestStarted method=POST pathClass=haAuthToken haAuthEndpointReached=True", logs)
+        self.assertIn("event=companionHAPathPolicy method=GET pathClass=other isAllowedHAPath=False haAuthEndpointReached=False allowed=False", logs)
+        self.assertIn("event=companionHAPathPolicy method=DELETE pathClass=other isAllowedHAPath=False haAuthEndpointReached=False allowed=False", logs)
+        self.assertNotIn(route_id, logs)
+        self.assertNotIn(tunnel_id, logs)
+        self.assertNotIn(origin_token, logs)
+        self.assertNotIn("ha_access_token_should_not_log", logs)
+        self.assertNotIn("raw_refresh_token", logs)
 
     def test_cloudflare_connector_token_tunnel_identity_is_extracted_safely(self):
         tunnel_id = "cf_abcdefghijklmnopqrstuvwxyz123456"
@@ -1007,6 +1183,17 @@ class CompanionP03Tests(unittest.TestCase):
         response.close()
         conn.close()
         return response.status, json.loads(raw.decode("utf-8") or "{}"), response_headers
+
+    def _request_status(self, method, base_url, path, headers=None):
+        host, port = base_url.split(":")
+        conn = HTTPConnection(host, int(port), timeout=5)
+        conn.request(method, path, headers=headers or {})
+        response = conn.getresponse()
+        status = response.status
+        response.read()
+        response.close()
+        conn.close()
+        return status
 
 
 if __name__ == "__main__":
