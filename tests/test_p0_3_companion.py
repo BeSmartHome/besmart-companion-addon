@@ -150,13 +150,13 @@ class CompanionP03Tests(unittest.TestCase):
         dockerfile = (addon_root / "Dockerfile").read_text(encoding="utf-8")
         runtime = (addon_root / "app.py").read_text(encoding="utf-8")
 
-        self.assertIn('version: "1.0.18"', config)
+        self.assertIn('version: "1.0.19"', config)
         self.assertIn("e2ee_pairing_authorization", config)
         self.assertIn("COPY app.py /app/app.py", dockerfile)
         self.assertIn("CLOUDFLARED_VERSION=2026.8.2", dockerfile)
         self.assertIn("BESMART_CLOUDFLARED_BIN=/usr/local/bin/cloudflared", dockerfile)
-        self.assertIn("SOSYNC_COMPANION_VERSION=1.0.18", dockerfile)
-        self.assertIn("SOSYNC_COMPANION_BUILD=1.0.18-secure-remote-tunnel-identity-diag-v1", dockerfile)
+        self.assertIn("SOSYNC_COMPANION_VERSION=1.0.19", dockerfile)
+        self.assertIn("SOSYNC_COMPANION_BUILD=1.0.19-secure-remote-status-identity-v1", dockerfile)
         self.assertIn("/usr/local/bin/cloudflared --version", dockerfile)
         self.assertIn('self.path == "/security/e2ee/identity"', runtime)
         self.assertIn('self.path == "/security/e2ee/pair"', runtime)
@@ -164,7 +164,7 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertIn("tunnelCredentialInstalled", runtime)
         self.assertIn("tunnelProcessStarted", runtime)
         self.assertIn("tunnelProcessFailed", runtime)
-        self.assertIn("1.0.18-secure-remote-tunnel-identity-diag-v1", runtime)
+        self.assertIn("1.0.19-secure-remote-status-identity-v1", runtime)
 
     def test_health_and_identity_expose_runtime_build_marker(self):
         with self._server() as base_url:
@@ -173,9 +173,9 @@ class CompanionP03Tests(unittest.TestCase):
 
         self.assertEqual(health_status, 200)
         self.assertEqual(identity_status, 200)
-        self.assertEqual(health["build"], "1.0.18-secure-remote-tunnel-identity-diag-v1")
-        self.assertEqual(identity["build"], "1.0.18-secure-remote-tunnel-identity-diag-v1")
-        self.assertEqual(health["companion_version"], "1.0.18")
+        self.assertEqual(health["build"], "1.0.19-secure-remote-status-identity-v1")
+        self.assertEqual(identity["build"], "1.0.19-secure-remote-status-identity-v1")
+        self.assertEqual(health["companion_version"], "1.0.19")
         self.assertIn("cloudflared_available", health)
         self.assertIn("cloudflared_running", health)
 
@@ -508,14 +508,32 @@ class CompanionP03Tests(unittest.TestCase):
                     "credential_version": 1,
                     "tunnel_credential": connector_token
                 })
+                status_code, status = self._request_json("GET", base_url, "/secure-remote/status")
+                app.write_secure_text_file(
+                    app.secure_remote_tunnel_token_file(),
+                    self._cloudflare_connector_token("cf_staleabcdefghijklmnopqrstuvwxyz123")
+                )
+                stale_status_code, stale_status = self._request_json("GET", base_url, "/secure-remote/status")
 
             self.assertEqual(install_status, 200)
             self.assertTrue(install["cloudflared_running"])
+            expected_hash = app.safe_fingerprint(cloudflare_tunnel_id)
             self.assertEqual(
                 app.SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY["cloudflare_connector_tunnel_id_hash"],
-                app.safe_fingerprint(cloudflare_tunnel_id)
+                expected_hash
             )
             self.assertTrue(app.SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY["available"])
+            self.assertEqual(status_code, 200)
+            self.assertEqual(status["cloudflare_connector_tunnel_id_hash"], expected_hash)
+            self.assertTrue(status["connector_tunnel_identity_available"])
+            self.assertEqual(status["connector_tunnel_identity_failure"], None)
+            self.assertEqual(stale_status_code, 200)
+            self.assertEqual(stale_status["cloudflare_connector_tunnel_id_hash"], expected_hash)
+            self.assertTrue(stale_status["connector_tunnel_identity_available"])
+            self.assertNotIn(cloudflare_tunnel_id, json.dumps(status))
+            self.assertNotIn(cloudflare_tunnel_id, json.dumps(stale_status))
+            self.assertNotIn(connector_token, json.dumps(status))
+            self.assertNotIn(connector_token, json.dumps(stale_status))
         finally:
             self._restore_cloudflared_start()
 
@@ -724,6 +742,9 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertFalse(status["tunnel_configured"])
         self.assertFalse(status["cloudflared_running"])
         self.assertEqual(status["tunnel_state"], "notConfigured")
+        self.assertEqual(status["cloudflare_connector_tunnel_id_hash"], "none")
+        self.assertFalse(status["connector_tunnel_identity_available"])
+        self.assertEqual(status["connector_tunnel_identity_failure"], "processNotRunning")
 
     def test_secure_remote_tunnel_install_uses_worker_connector_token_mode(self):
         route_id = "r_abcdefghijklmnopqrstuvwxyz123456"

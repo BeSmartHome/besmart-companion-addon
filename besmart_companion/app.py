@@ -66,8 +66,8 @@ SETUP_PACKAGE_ENCRYPTION_ALG = "HPKE-X25519-HKDF-SHA256-CHACHA20-POLY1305"
 SETUP_PACKAGE_SIGNATURE_ALG = "Ed25519"
 RUNTIME_INSTANCE_ID = str(uuid.uuid4())
 RUNTIME_STARTED_AT = datetime.now(timezone.utc).isoformat()
-SOSYNC_COMPANION_VERSION = os.environ.get("SOSYNC_COMPANION_VERSION", "1.0.18")
-SOSYNC_COMPANION_BUILD = os.environ.get("SOSYNC_COMPANION_BUILD", "1.0.18-secure-remote-tunnel-identity-diag-v1")
+SOSYNC_COMPANION_VERSION = os.environ.get("SOSYNC_COMPANION_VERSION", "1.0.19")
+SOSYNC_COMPANION_BUILD = os.environ.get("SOSYNC_COMPANION_BUILD", "1.0.19-secure-remote-status-identity-v1")
 SECURE_REMOTE_TUNNEL_CONFIRMATION_SECONDS = float(os.environ.get("SOSYNC_TUNNEL_CONFIRMATION_SECONDS", "1.0"))
 SECURE_REMOTE_TUNNEL_LOCK = threading.Lock()
 SECURE_REMOTE_TUNNEL_PROCESS = None
@@ -2101,6 +2101,7 @@ def secure_remote_public_status(binding=None):
         tunnel_state = "notConfigured"
         tunnel_configured = False
     runtime = cloudflared_runtime_status()
+    connector_identity = secure_remote_current_process_connector_identity(cloudflared_running)
     return {
         "protocol_version": 1,
         "configured": has_route,
@@ -2118,8 +2119,34 @@ def secure_remote_public_status(binding=None):
         "failure_reason": binding.get("failure_reason"),
         "last_healthy_at": binding.get("last_healthy_at"),
         "cloudflared_running": cloudflared_running,
+        "cloudflare_connector_tunnel_id_hash": connector_identity["cloudflare_connector_tunnel_id_hash"],
+        "connector_tunnel_identity_available": connector_identity["connector_tunnel_identity_available"],
+        "connector_tunnel_identity_failure": connector_identity["connector_tunnel_identity_failure"],
         "updated_at": binding.get("updated_at"),
         "revoked_at": binding.get("revoked_at")
+    }
+
+
+def secure_remote_current_process_connector_identity(cloudflared_running):
+    if not cloudflared_running:
+        return {
+            "cloudflare_connector_tunnel_id_hash": "none",
+            "connector_tunnel_identity_available": False,
+            "connector_tunnel_identity_failure": "processNotRunning"
+        }
+    identity = SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY if isinstance(SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY, dict) else None
+    if not identity:
+        return {
+            "cloudflare_connector_tunnel_id_hash": "none",
+            "connector_tunnel_identity_available": False,
+            "connector_tunnel_identity_failure": "identityNotCaptured"
+        }
+    connector_hash = str(identity.get("cloudflare_connector_tunnel_id_hash") or "none").strip() or "none"
+    available = bool(identity.get("available"))
+    return {
+        "cloudflare_connector_tunnel_id_hash": connector_hash,
+        "connector_tunnel_identity_available": available,
+        "connector_tunnel_identity_failure": identity.get("failure") or (None if available else "identityUnavailable")
     }
 
 
