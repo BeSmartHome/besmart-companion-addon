@@ -66,8 +66,8 @@ SETUP_PACKAGE_ENCRYPTION_ALG = "HPKE-X25519-HKDF-SHA256-CHACHA20-POLY1305"
 SETUP_PACKAGE_SIGNATURE_ALG = "Ed25519"
 RUNTIME_INSTANCE_ID = str(uuid.uuid4())
 RUNTIME_STARTED_AT = datetime.now(timezone.utc).isoformat()
-SOSYNC_COMPANION_VERSION = os.environ.get("SOSYNC_COMPANION_VERSION", "1.0.16")
-SOSYNC_COMPANION_BUILD = os.environ.get("SOSYNC_COMPANION_BUILD", "1.0.16-secure-remote-prepare-contract-v1")
+SOSYNC_COMPANION_VERSION = os.environ.get("SOSYNC_COMPANION_VERSION", "1.0.17")
+SOSYNC_COMPANION_BUILD = os.environ.get("SOSYNC_COMPANION_BUILD", "1.0.17-secure-remote-dataplane-health-v1")
 SECURE_REMOTE_TUNNEL_CONFIRMATION_SECONDS = float(os.environ.get("SOSYNC_TUNNEL_CONFIRMATION_SECONDS", "1.0"))
 SECURE_REMOTE_TUNNEL_LOCK = threading.Lock()
 SECURE_REMOTE_TUNNEL_PROCESS = None
@@ -95,16 +95,18 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self._reject_public_management_request():
             return
+        parsed_request = urlparse(self.path)
+        request_path = parsed_request.path
 
-        if self.path.startswith(SIGNED_REMOTE_PREFIX):
+        if request_path.startswith(SIGNED_REMOTE_PREFIX):
             self._proxy_signed_home_assistant()
             return
 
-        if self.path == "/secure-remote/data-plane/health":
+        if request_path in ("/secure-remote/data-plane/health", "/secure-remote/data-plane/health/"):
             self._handle_secure_remote_dataplane_health()
             return
 
-        if self.path.startswith("/secure-remote/data-plane/ha"):
+        if request_path.startswith("/secure-remote/data-plane/ha"):
             self._proxy_secure_remote_home_assistant()
             return
 
@@ -606,7 +608,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         process_running = is_secure_remote_tunnel_running()
         print(
-            f"[SOSYNC-SECURE-REMOTE-DATAPLANE] health route={safe_fingerprint(binding.get('route_id'))} tunnelState={binding.get('tunnel_state') or 'unconfigured'} cloudflaredRunning={process_running}",
+            f"[SOSYNC-SECURE-REMOTE-DATAPLANE] health method={self.command} path={urlparse(self.path).path} route={safe_fingerprint(binding.get('route_id'))} tunnelState={binding.get('tunnel_state') or 'unconfigured'} cloudflaredRunning={process_running}",
             flush=True
         )
         if process_running:
@@ -615,7 +617,9 @@ class Handler(BaseHTTPRequestHandler):
             binding["updated_at"] = iso_now()
             write_json_file_secure(SECURE_REMOTE_BINDING_FILE, binding)
         self._json(200 if process_running else 503, {
+            "protocol_version": 1,
             "status": "ok" if process_running else "unavailable",
+            "service": "besmart-companion-secure-remote",
             "tunnel_state": binding.get("tunnel_state") or "unconfigured",
             "route_id_fingerprint": safe_fingerprint(binding.get("route_id"))
         })

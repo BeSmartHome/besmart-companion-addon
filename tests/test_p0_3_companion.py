@@ -150,13 +150,13 @@ class CompanionP03Tests(unittest.TestCase):
         dockerfile = (addon_root / "Dockerfile").read_text(encoding="utf-8")
         runtime = (addon_root / "app.py").read_text(encoding="utf-8")
 
-        self.assertIn('version: "1.0.16"', config)
+        self.assertIn('version: "1.0.17"', config)
         self.assertIn("e2ee_pairing_authorization", config)
         self.assertIn("COPY app.py /app/app.py", dockerfile)
         self.assertIn("CLOUDFLARED_VERSION=2026.8.2", dockerfile)
         self.assertIn("BESMART_CLOUDFLARED_BIN=/usr/local/bin/cloudflared", dockerfile)
-        self.assertIn("SOSYNC_COMPANION_VERSION=1.0.16", dockerfile)
-        self.assertIn("SOSYNC_COMPANION_BUILD=1.0.16-secure-remote-prepare-contract-v1", dockerfile)
+        self.assertIn("SOSYNC_COMPANION_VERSION=1.0.17", dockerfile)
+        self.assertIn("SOSYNC_COMPANION_BUILD=1.0.17-secure-remote-dataplane-health-v1", dockerfile)
         self.assertIn("/usr/local/bin/cloudflared --version", dockerfile)
         self.assertIn('self.path == "/security/e2ee/identity"', runtime)
         self.assertIn('self.path == "/security/e2ee/pair"', runtime)
@@ -164,7 +164,7 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertIn("tunnelCredentialInstalled", runtime)
         self.assertIn("tunnelProcessStarted", runtime)
         self.assertIn("tunnelProcessFailed", runtime)
-        self.assertIn("1.0.16-secure-remote-prepare-contract-v1", runtime)
+        self.assertIn("1.0.17-secure-remote-dataplane-health-v1", runtime)
 
     def test_health_and_identity_expose_runtime_build_marker(self):
         with self._server() as base_url:
@@ -173,9 +173,9 @@ class CompanionP03Tests(unittest.TestCase):
 
         self.assertEqual(health_status, 200)
         self.assertEqual(identity_status, 200)
-        self.assertEqual(health["build"], "1.0.16-secure-remote-prepare-contract-v1")
-        self.assertEqual(identity["build"], "1.0.16-secure-remote-prepare-contract-v1")
-        self.assertEqual(health["companion_version"], "1.0.16")
+        self.assertEqual(health["build"], "1.0.17-secure-remote-dataplane-health-v1")
+        self.assertEqual(identity["build"], "1.0.17-secure-remote-dataplane-health-v1")
+        self.assertEqual(health["companion_version"], "1.0.17")
         self.assertIn("cloudflared_available", health)
         self.assertIn("cloudflared_running", health)
 
@@ -374,6 +374,49 @@ class CompanionP03Tests(unittest.TestCase):
         serialized = json.dumps(status)
         self.assertNotIn("secret-tunnel-credential", serialized)
         self.assertNotIn("tunnel_credential", serialized)
+
+    def test_secure_remote_dataplane_health_contract_is_versioned_and_path_stable(self):
+        route_id = "r_abcdefghijklmnopqrstuvwxyz123456"
+        tunnel_id = "tun_abcdefghijklmnopqrstuvwxyz123456"
+        self._patch_cloudflared_start(running=True)
+        try:
+            with self._server() as base_url:
+                provision_status, _ = self._request_json("POST", base_url, "/secure-remote/provision", {
+                    "protocol_version": 1,
+                    "route_id": route_id,
+                    "tunnel_binding_id": tunnel_id,
+                    "home_reference": "home_ref",
+                    "device_reference": "device_ref",
+                    "device_public_key_fingerprint": "device_fp",
+                    "companion_public_key_fingerprint": "companion_key_fp",
+                    "companion_identity_fingerprint": "companion_identity_fp",
+                    "credential_version": 1,
+                    "origin_access_token": "orig_abcdefghijklmnopqrstuvwxyz123456"
+                })
+                install_status, _ = self._request_json("POST", base_url, "/secure-remote/tunnel/install", {
+                    "protocol_version": 1,
+                    "route_id": route_id,
+                    "credential_version": 1,
+                    "tunnel_credential": "secret-tunnel-credential"
+                })
+                health_status, health = self._request_json("GET", base_url, "/secure-remote/data-plane/health/", headers={
+                    "X-SoSync-Secure-Remote-Route": tunnel_id,
+                    "X-SoSync-Secure-Remote-Origin-Token": "orig_abcdefghijklmnopqrstuvwxyz123456"
+                })
+        finally:
+            self._restore_cloudflared_start()
+
+        self.assertEqual(provision_status, 200)
+        self.assertEqual(install_status, 200)
+        self.assertEqual(health_status, 200)
+        self.assertEqual(health["protocol_version"], 1)
+        self.assertEqual(health["status"], "ok")
+        self.assertEqual(health["service"], "besmart-companion-secure-remote")
+        self.assertEqual(health["tunnel_state"], "active")
+        self.assertIn("route_id_fingerprint", health)
+        serialized = json.dumps(health)
+        self.assertNotIn("secret-tunnel-credential", serialized)
+        self.assertNotIn("orig_abcdefghijklmnopqrstuvwxyz123456", serialized)
 
     def test_secure_remote_prepare_clears_stale_connector_credential(self):
         app.write_secure_text_file(app.secure_remote_tunnel_token_file(), "stale-secret-tunnel-credential")
