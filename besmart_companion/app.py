@@ -66,11 +66,12 @@ SETUP_PACKAGE_ENCRYPTION_ALG = "HPKE-X25519-HKDF-SHA256-CHACHA20-POLY1305"
 SETUP_PACKAGE_SIGNATURE_ALG = "Ed25519"
 RUNTIME_INSTANCE_ID = str(uuid.uuid4())
 RUNTIME_STARTED_AT = datetime.now(timezone.utc).isoformat()
-SOSYNC_COMPANION_VERSION = os.environ.get("SOSYNC_COMPANION_VERSION", "1.0.17")
-SOSYNC_COMPANION_BUILD = os.environ.get("SOSYNC_COMPANION_BUILD", "1.0.17-secure-remote-dataplane-health-v1")
+SOSYNC_COMPANION_VERSION = os.environ.get("SOSYNC_COMPANION_VERSION", "1.0.18")
+SOSYNC_COMPANION_BUILD = os.environ.get("SOSYNC_COMPANION_BUILD", "1.0.18-secure-remote-tunnel-identity-diag-v1")
 SECURE_REMOTE_TUNNEL_CONFIRMATION_SECONDS = float(os.environ.get("SOSYNC_TUNNEL_CONFIRMATION_SECONDS", "1.0"))
 SECURE_REMOTE_TUNNEL_LOCK = threading.Lock()
 SECURE_REMOTE_TUNNEL_PROCESS = None
+SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY = None
 print(
     f"[SOSYNC-E2EE-COMPANION] runtimeGlobalsInitialized runtimeInstance={RUNTIME_INSTANCE_ID} build={SOSYNC_COMPANION_BUILD}",
     flush=True
@@ -78,12 +79,14 @@ print(
 
 
 class Handler(BaseHTTPRequestHandler):
-    def _json(self, status, payload):
+    def _json(self, status, payload, headers=None):
         body = json.dumps(payload).encode("utf-8")
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            for name, value in (headers or {}).items():
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(body)
         except BrokenPipeError:
@@ -196,7 +199,14 @@ class Handler(BaseHTTPRequestHandler):
             })
             return
 
-        self._json(404, {"error": "not_found"})
+        self._json(404, {
+            "error": "not_found",
+            "service": "besmart-companion",
+            "route": "fallback"
+        }, headers={
+            "X-SoSync-Origin": "companion",
+            "X-SoSync-Route": "fallback"
+        })
 
     def do_PUT(self):
         if self._reject_public_management_request():
@@ -598,17 +608,36 @@ class Handler(BaseHTTPRequestHandler):
         route_ok = hmac.compare_digest(str(route or ""), str(binding.get("tunnel_binding_id") or ""))
         token_ok = bool(stored_token) and hmac.compare_digest(str(token or ""), stored_token)
         if not route_ok or not token_ok:
-            self._json(401, {"error": "unauthorized"})
+            self._json(401, {"error": "unauthorized"}, headers={
+                "X-SoSync-Origin": "companion",
+                "X-SoSync-Route": "auth"
+            })
             return None
         return binding
 
     def _handle_secure_remote_dataplane_health(self):
-        binding = self._authorize_secure_remote_dataplane()
-        if not binding:
+        request_path = urlparse(self.path).path
+        print(
+            f"[SOSYNC-SECURE-REMOTE-DATAPLANE] method={self.command} pathname={request_path} handlerReached=true",
+            flush=True
+        )
+        binding = read_secure_remote_binding()
+        if not binding.get("route_id") or binding.get("status") == "revoked":
+            self._json(403, {
+                "protocol_version": 1,
+                "status": "unbound",
+                "service": "besmart-companion-secure-remote",
+                "tunnel_state": "unconfigured",
+                "route_id_fingerprint": safe_fingerprint(binding.get("route_id")),
+                "tunnel_binding_fingerprint": safe_fingerprint(binding.get("tunnel_binding_id"))
+            }, headers={
+                "X-SoSync-Origin": "companion",
+                "X-SoSync-Route": "health"
+            })
             return
         process_running = is_secure_remote_tunnel_running()
         print(
-            f"[SOSYNC-SECURE-REMOTE-DATAPLANE] health method={self.command} path={urlparse(self.path).path} route={safe_fingerprint(binding.get('route_id'))} tunnelState={binding.get('tunnel_state') or 'unconfigured'} cloudflaredRunning={process_running}",
+            f"[SOSYNC-SECURE-REMOTE-DATAPLANE] health method={self.command} path={request_path} route={safe_fingerprint(binding.get('route_id'))} tunnelBinding={safe_fingerprint(binding.get('tunnel_binding_id'))} tunnelState={binding.get('tunnel_state') or 'unconfigured'} cloudflaredRunning={process_running}",
             flush=True
         )
         if process_running:
@@ -621,7 +650,11 @@ class Handler(BaseHTTPRequestHandler):
             "status": "ok" if process_running else "unavailable",
             "service": "besmart-companion-secure-remote",
             "tunnel_state": binding.get("tunnel_state") or "unconfigured",
-            "route_id_fingerprint": safe_fingerprint(binding.get("route_id"))
+            "route_id_fingerprint": safe_fingerprint(binding.get("route_id")),
+            "tunnel_binding_fingerprint": safe_fingerprint(binding.get("tunnel_binding_id"))
+        }, headers={
+            "X-SoSync-Origin": "companion",
+            "X-SoSync-Route": "health"
         })
 
     def _proxy_secure_remote_home_assistant(self):
@@ -2175,6 +2208,7 @@ def is_secure_remote_tunnel_running():
 
 def start_secure_remote_tunnel(binding=None):
     global SECURE_REMOTE_TUNNEL_PROCESS
+    global SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY
     binding = binding if isinstance(binding, dict) else read_secure_remote_binding()
     token = read_secure_text_file(secure_remote_tunnel_token_file())
     if not token or not binding.get("route_id") or binding.get("status") == "revoked":
@@ -2185,8 +2219,13 @@ def start_secure_remote_tunnel(binding=None):
         return {"running": False, "stage": "credential", "reason": "missingCredentialOrRoute"}
     with SECURE_REMOTE_TUNNEL_LOCK:
         if SECURE_REMOTE_TUNNEL_PROCESS is not None and SECURE_REMOTE_TUNNEL_PROCESS.poll() is None:
+            process_identity = SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY or {"available": False, "failure": "identityNotCaptured", "cloudflare_connector_tunnel_id_hash": "none"}
             print(
                 f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelProcessConfirmed route={safe_fingerprint(binding.get('route_id'))} running=true reused=true",
+                flush=True
+            )
+            print(
+                f"[SOSYNC-SECURE-REMOTE-IDENTITY] cloudflareConnectorTunnelIDHash={process_identity.get('cloudflare_connector_tunnel_id_hash')} connectorTunnelIdentityAvailable={str(bool(process_identity.get('available'))).lower()} connectorTunnelIdentityFailure={process_identity.get('failure') or 'none'} tunnelManagementMode=remoteManaged effectiveIngressSource=cloudflareApi cloudflaredRunning=true",
                 flush=True
             )
             return {"running": True, "stage": "confirmed", "reason": None}
@@ -2211,8 +2250,13 @@ def start_secure_remote_tunnel(binding=None):
                 # /accounts/:account/cfd_tunnel/:id/token. The companion must
                 # launch cloudflared in token mode; the token is never logged.
                 command = [cloudflared_path, "--no-autoupdate", "tunnel", "run", "--token", token]
+                token_identity = decode_cloudflare_connector_token_identity(token)
                 print(
-                    f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelProcessSpawnStarted route={safe_fingerprint(binding.get('route_id'))} mode=token",
+                    f"[SOSYNC-SECURE-REMOTE-IDENTITY] cloudflareConnectorTunnelIDHash={token_identity.get('cloudflare_connector_tunnel_id_hash')} connectorTunnelIdentityAvailable={str(bool(token_identity.get('available'))).lower()} connectorTunnelIdentityFailure={token_identity.get('failure') or 'none'} tunnelManagementMode=remoteManaged effectiveIngressSource=cloudflareApi cloudflaredRunning=false",
+                    flush=True
+                )
+                print(
+                    f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelProcessSpawnStarted route={safe_fingerprint(binding.get('route_id'))} mode=token tunnelManagementMode=remoteManaged localConfigSupplied=false effectiveIngressSource=cloudflareApi command={cloudflared_path} --no-autoupdate tunnel run --token [redacted]",
                     flush=True
                 )
                 SECURE_REMOTE_TUNNEL_PROCESS = subprocess.Popen(
@@ -2243,10 +2287,16 @@ def start_secure_remote_tunnel(binding=None):
                     flush=True
                 )
                 SECURE_REMOTE_TUNNEL_PROCESS = None
+                SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY = None
                 return {"running": False, "stage": "immediateExit", "reason": "processExited"}
             if SECURE_REMOTE_TUNNEL_PROCESS.poll() is None:
+                SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY = token_identity
                 print(
                     f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelProcessConfirmed route={safe_fingerprint(binding.get('route_id'))} running=true",
+                    flush=True
+                )
+                print(
+                    f"[SOSYNC-SECURE-REMOTE-IDENTITY] cloudflareConnectorTunnelIDHash={token_identity.get('cloudflare_connector_tunnel_id_hash')} connectorTunnelIdentityAvailable={str(bool(token_identity.get('available'))).lower()} connectorTunnelIdentityFailure={token_identity.get('failure') or 'none'} tunnelManagementMode=remoteManaged effectiveIngressSource=cloudflareApi cloudflaredRunning=true",
                     flush=True
                 )
                 return {"running": True, "stage": "confirmed", "reason": None}
@@ -2255,6 +2305,7 @@ def start_secure_remote_tunnel(binding=None):
                 flush=True
             )
             SECURE_REMOTE_TUNNEL_PROCESS = None
+            SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY = None
             return {"running": False, "stage": "confirmationTimeout", "reason": "notRunning"}
         except Exception as error:
             print(
@@ -2262,14 +2313,17 @@ def start_secure_remote_tunnel(binding=None):
                 flush=True
             )
             SECURE_REMOTE_TUNNEL_PROCESS = None
+            SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY = None
             return {"running": False, "stage": "processStart", "reason": type(error).__name__}
 
 
 def stop_secure_remote_tunnel():
     global SECURE_REMOTE_TUNNEL_PROCESS
+    global SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY
     with SECURE_REMOTE_TUNNEL_LOCK:
         process = SECURE_REMOTE_TUNNEL_PROCESS
         SECURE_REMOTE_TUNNEL_PROCESS = None
+        SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY = None
     if process is not None and process.poll() is None:
         process.terminate()
         try:
@@ -2300,6 +2354,56 @@ def safe_fingerprint(value):
     if not value:
         return "none"
     return sha256_base64url(str(value).encode("utf-8"))[:16]
+
+
+def decode_cloudflare_connector_token_identity(token):
+    try:
+        parts = str(token or "").strip().split(".")
+        if len(parts) != 3:
+            return {
+                "available": False,
+                "failure": "notJWT",
+                "cloudflare_connector_tunnel_id_hash": "none"
+            }
+        payload = json.loads(base64url_decode(parts[1]).decode("utf-8"))
+        tunnel_id = first_string_value(payload, ["t", "tunnel_id", "tunnelID", "TunnelID"])
+        if not tunnel_id:
+            return {
+                "available": False,
+                "failure": "tunnelIDMissing",
+                "cloudflare_connector_tunnel_id_hash": "none"
+            }
+        return {
+            "available": True,
+            "failure": None,
+            "cloudflare_connector_tunnel_id_hash": safe_fingerprint(tunnel_id)
+        }
+    except Exception:
+        return {
+            "available": False,
+            "failure": "decodeFailed",
+            "cloudflare_connector_tunnel_id_hash": "none"
+        }
+
+
+def compare_cloudflare_tunnel_identity(expected_hash, connector_identity):
+    expected = str(expected_hash or "").strip()
+    connector_hash = str((connector_identity or {}).get("cloudflare_connector_tunnel_id_hash") or "").strip()
+    if not expected:
+        return {"can_compare": False, "matches": False, "failure": "expectedMissing"}
+    if not (connector_identity or {}).get("available") or not connector_hash or connector_hash == "none":
+        return {"can_compare": False, "matches": False, "failure": (connector_identity or {}).get("failure") or "connectorMissing"}
+    return {"can_compare": True, "matches": hmac.compare_digest(expected, connector_hash), "failure": None}
+
+
+def first_string_value(mapping, keys):
+    if not isinstance(mapping, dict):
+        return None
+    for key in keys:
+        value = mapping.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
 
 
 def iso_now():

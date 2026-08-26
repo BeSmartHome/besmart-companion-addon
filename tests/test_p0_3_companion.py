@@ -150,13 +150,13 @@ class CompanionP03Tests(unittest.TestCase):
         dockerfile = (addon_root / "Dockerfile").read_text(encoding="utf-8")
         runtime = (addon_root / "app.py").read_text(encoding="utf-8")
 
-        self.assertIn('version: "1.0.17"', config)
+        self.assertIn('version: "1.0.18"', config)
         self.assertIn("e2ee_pairing_authorization", config)
         self.assertIn("COPY app.py /app/app.py", dockerfile)
         self.assertIn("CLOUDFLARED_VERSION=2026.8.2", dockerfile)
         self.assertIn("BESMART_CLOUDFLARED_BIN=/usr/local/bin/cloudflared", dockerfile)
-        self.assertIn("SOSYNC_COMPANION_VERSION=1.0.17", dockerfile)
-        self.assertIn("SOSYNC_COMPANION_BUILD=1.0.17-secure-remote-dataplane-health-v1", dockerfile)
+        self.assertIn("SOSYNC_COMPANION_VERSION=1.0.18", dockerfile)
+        self.assertIn("SOSYNC_COMPANION_BUILD=1.0.18-secure-remote-tunnel-identity-diag-v1", dockerfile)
         self.assertIn("/usr/local/bin/cloudflared --version", dockerfile)
         self.assertIn('self.path == "/security/e2ee/identity"', runtime)
         self.assertIn('self.path == "/security/e2ee/pair"', runtime)
@@ -164,7 +164,7 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertIn("tunnelCredentialInstalled", runtime)
         self.assertIn("tunnelProcessStarted", runtime)
         self.assertIn("tunnelProcessFailed", runtime)
-        self.assertIn("1.0.17-secure-remote-dataplane-health-v1", runtime)
+        self.assertIn("1.0.18-secure-remote-tunnel-identity-diag-v1", runtime)
 
     def test_health_and_identity_expose_runtime_build_marker(self):
         with self._server() as base_url:
@@ -173,9 +173,9 @@ class CompanionP03Tests(unittest.TestCase):
 
         self.assertEqual(health_status, 200)
         self.assertEqual(identity_status, 200)
-        self.assertEqual(health["build"], "1.0.17-secure-remote-dataplane-health-v1")
-        self.assertEqual(identity["build"], "1.0.17-secure-remote-dataplane-health-v1")
-        self.assertEqual(health["companion_version"], "1.0.17")
+        self.assertEqual(health["build"], "1.0.18-secure-remote-tunnel-identity-diag-v1")
+        self.assertEqual(identity["build"], "1.0.18-secure-remote-tunnel-identity-diag-v1")
+        self.assertEqual(health["companion_version"], "1.0.18")
         self.assertIn("cloudflared_available", health)
         self.assertIn("cloudflared_running", health)
 
@@ -375,7 +375,7 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertNotIn("secret-tunnel-credential", serialized)
         self.assertNotIn("tunnel_credential", serialized)
 
-    def test_secure_remote_dataplane_health_contract_is_versioned_and_path_stable(self):
+    def test_secure_remote_dataplane_health_contract_is_versioned_public_and_path_stable(self):
         route_id = "r_abcdefghijklmnopqrstuvwxyz123456"
         tunnel_id = "tun_abcdefghijklmnopqrstuvwxyz123456"
         self._patch_cloudflared_start(running=True)
@@ -399,10 +399,7 @@ class CompanionP03Tests(unittest.TestCase):
                     "credential_version": 1,
                     "tunnel_credential": "secret-tunnel-credential"
                 })
-                health_status, health = self._request_json("GET", base_url, "/secure-remote/data-plane/health/", headers={
-                    "X-SoSync-Secure-Remote-Route": tunnel_id,
-                    "X-SoSync-Secure-Remote-Origin-Token": "orig_abcdefghijklmnopqrstuvwxyz123456"
-                })
+                health_status, health, headers = self._request_json_response("GET", base_url, "/secure-remote/data-plane/health/")
         finally:
             self._restore_cloudflared_start()
 
@@ -414,9 +411,113 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertEqual(health["service"], "besmart-companion-secure-remote")
         self.assertEqual(health["tunnel_state"], "active")
         self.assertIn("route_id_fingerprint", health)
+        self.assertIn("tunnel_binding_fingerprint", health)
+        self.assertEqual(health["tunnel_binding_fingerprint"], app.safe_fingerprint(tunnel_id))
+        self.assertEqual(headers.get("X-SoSync-Origin"), "companion")
+        self.assertEqual(headers.get("X-SoSync-Route"), "health")
         serialized = json.dumps(health)
         self.assertNotIn("secret-tunnel-credential", serialized)
         self.assertNotIn("orig_abcdefghijklmnopqrstuvwxyz123456", serialized)
+
+    def test_secure_remote_protected_endpoints_remain_authorized_and_unknown_path_is_marked(self):
+        route_id = "r_abcdefghijklmnopqrstuvwxyz123456"
+        tunnel_id = "tun_abcdefghijklmnopqrstuvwxyz123456"
+        self._patch_cloudflared_start(running=True)
+        try:
+            with self._server() as base_url:
+                self._request_json("POST", base_url, "/secure-remote/provision", {
+                    "protocol_version": 1,
+                    "route_id": route_id,
+                    "tunnel_binding_id": tunnel_id,
+                    "home_reference": "home_ref",
+                    "device_reference": "device_ref",
+                    "device_public_key_fingerprint": "device_fp",
+                    "companion_public_key_fingerprint": "companion_key_fp",
+                    "companion_identity_fingerprint": "companion_identity_fp",
+                    "credential_version": 1,
+                    "origin_access_token": "orig_abcdefghijklmnopqrstuvwxyz123456"
+                })
+                self._request_json("POST", base_url, "/secure-remote/tunnel/install", {
+                    "protocol_version": 1,
+                    "route_id": route_id,
+                    "credential_version": 1,
+                    "tunnel_credential": "secret-tunnel-credential"
+                })
+                proxy_code, proxy_body, proxy_headers = self._request_json_response("GET", base_url, "/secure-remote/data-plane/ha/api/states")
+                missing_code, missing_body, missing_headers = self._request_json_response("GET", base_url, "/secure-remote/data-plane/missing")
+        finally:
+            self._restore_cloudflared_start()
+
+        self.assertEqual(proxy_code, 401)
+        self.assertEqual(proxy_body["error"], "unauthorized")
+        self.assertEqual(proxy_headers.get("X-SoSync-Origin"), "companion")
+        self.assertEqual(proxy_headers.get("X-SoSync-Route"), "auth")
+        self.assertEqual(missing_code, 404)
+        self.assertEqual(missing_body["error"], "not_found")
+        self.assertEqual(missing_headers.get("X-SoSync-Origin"), "companion")
+        self.assertEqual(missing_headers.get("X-SoSync-Route"), "fallback")
+
+    def test_cloudflare_connector_token_tunnel_identity_is_extracted_safely(self):
+        tunnel_id = "cf_abcdefghijklmnopqrstuvwxyz123456"
+        token = self._cloudflare_connector_token(tunnel_id)
+        identity = app.decode_cloudflare_connector_token_identity(token)
+        malformed = app.decode_cloudflare_connector_token_identity("not-a-token")
+        missing = app.decode_cloudflare_connector_token_identity(self._cloudflare_connector_token(None))
+
+        self.assertTrue(identity["available"])
+        self.assertEqual(identity["failure"], None)
+        self.assertEqual(identity["cloudflare_connector_tunnel_id_hash"], app.safe_fingerprint(tunnel_id))
+        self.assertFalse(malformed["available"])
+        self.assertEqual(malformed["failure"], "notJWT")
+        self.assertFalse(missing["available"])
+        self.assertEqual(missing["failure"], "tunnelIDMissing")
+        self.assertNotIn(tunnel_id, json.dumps(identity))
+
+        match = app.compare_cloudflare_tunnel_identity(app.safe_fingerprint(tunnel_id), identity)
+        mismatch = app.compare_cloudflare_tunnel_identity(app.safe_fingerprint("other-tunnel"), identity)
+        malformed_compare = app.compare_cloudflare_tunnel_identity(app.safe_fingerprint(tunnel_id), malformed)
+        self.assertTrue(match["can_compare"])
+        self.assertTrue(match["matches"])
+        self.assertTrue(mismatch["can_compare"])
+        self.assertFalse(mismatch["matches"])
+        self.assertFalse(malformed_compare["can_compare"])
+        self.assertFalse(malformed_compare["matches"])
+
+    def test_cloudflare_connector_identity_is_bound_to_confirmed_process_runtime(self):
+        route_id = "r_abcdefghijklmnopqrstuvwxyz123456"
+        tunnel_id = "tun_abcdefghijklmnopqrstuvwxyz123456"
+        cloudflare_tunnel_id = "cf_abcdefghijklmnopqrstuvwxyz123456"
+        connector_token = self._cloudflare_connector_token(cloudflare_tunnel_id)
+        self._patch_cloudflared_start(running=True)
+        try:
+            with self._server() as base_url:
+                self._request_json("POST", base_url, "/secure-remote/provision", {
+                    "protocol_version": 1,
+                    "route_id": route_id,
+                    "tunnel_binding_id": tunnel_id,
+                    "home_reference": "home_ref",
+                    "device_reference": "device_ref",
+                    "device_public_key_fingerprint": "device_fp",
+                    "companion_public_key_fingerprint": "companion_key_fp",
+                    "companion_identity_fingerprint": "companion_identity_fp",
+                    "credential_version": 1
+                })
+                install_status, install = self._request_json("POST", base_url, "/secure-remote/tunnel/install", {
+                    "protocol_version": 1,
+                    "route_id": route_id,
+                    "credential_version": 1,
+                    "tunnel_credential": connector_token
+                })
+
+            self.assertEqual(install_status, 200)
+            self.assertTrue(install["cloudflared_running"])
+            self.assertEqual(
+                app.SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY["cloudflare_connector_tunnel_id_hash"],
+                app.safe_fingerprint(cloudflare_tunnel_id)
+            )
+            self.assertTrue(app.SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY["available"])
+        finally:
+            self._restore_cloudflared_start()
 
     def test_secure_remote_prepare_clears_stale_connector_credential(self):
         app.write_secure_text_file(app.secure_remote_tunnel_token_file(), "stale-secret-tunnel-credential")
@@ -716,6 +817,7 @@ class CompanionP03Tests(unittest.TestCase):
         self._original_popen = app.subprocess.Popen
         self._original_run = app.subprocess.run
         app.SECURE_REMOTE_TUNNEL_PROCESS = None
+        app.SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY = None
         app.shutil.which = lambda binary: None if missing else "/usr/local/bin/cloudflared"
         app.subprocess.run = lambda *args, **kwargs: type("Completed", (), {"returncode": 0, "stdout": "cloudflared version 2026.8.2", "stderr": ""})()
 
@@ -749,12 +851,19 @@ class CompanionP03Tests(unittest.TestCase):
 
     def _restore_cloudflared_start(self):
         app.SECURE_REMOTE_TUNNEL_PROCESS = None
+        app.SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY = None
         if hasattr(self, "_original_shutil_which"):
             app.shutil.which = self._original_shutil_which
         if hasattr(self, "_original_popen"):
             app.subprocess.Popen = self._original_popen
         if hasattr(self, "_original_run"):
             app.subprocess.run = self._original_run
+
+    def _cloudflare_connector_token(self, tunnel_id):
+        header = app.base64url_encode(json.dumps({"alg": "none"}).encode("utf-8"))
+        payload = {} if tunnel_id is None else {"t": tunnel_id, "s": "secret-not-logged", "a": "account-not-logged"}
+        encoded_payload = app.base64url_encode(json.dumps(payload).encode("utf-8"))
+        return f"{header}.{encoded_payload}.signature"
 
     def _write_options(self, value):
         Path(app.ADDON_OPTIONS_FILE).write_text(json.dumps(value), encoding="utf-8")
@@ -826,6 +935,10 @@ class CompanionP03Tests(unittest.TestCase):
             self_outer.thread.join(timeout=2)
 
     def _request_json(self, method, base_url, path, body=None, headers=None):
+        status, parsed, _ = self._request_json_response(method, base_url, path, body, headers)
+        return status, parsed
+
+    def _request_json_response(self, method, base_url, path, body=None, headers=None):
         host, port = base_url.split(":")
         conn = HTTPConnection(host, int(port), timeout=5)
         payload = json.dumps(body).encode("utf-8") if body is not None else None
@@ -834,10 +947,11 @@ class CompanionP03Tests(unittest.TestCase):
             request_headers.update(headers)
         conn.request(method, path, body=payload, headers=request_headers)
         response = conn.getresponse()
+        response_headers = dict(response.getheaders())
         raw = response.read()
         response.close()
         conn.close()
-        return response.status, json.loads(raw.decode("utf-8") or "{}")
+        return response.status, json.loads(raw.decode("utf-8") or "{}"), response_headers
 
 
 if __name__ == "__main__":
