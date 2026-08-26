@@ -1,7 +1,7 @@
 name: "BeSmart Companion"
 slug: "besmart_companion"
 description: "Local setup companion for BeSmart Home Server"
-version: "1.0.19"
+version: "1.0.20"
 
 arch:
   - aarch64

@@ -66,8 +66,8 @@ SETUP_PACKAGE_ENCRYPTION_ALG = "HPKE-X25519-HKDF-SHA256-CHACHA20-POLY1305"
 SETUP_PACKAGE_SIGNATURE_ALG = "Ed25519"
 RUNTIME_INSTANCE_ID = str(uuid.uuid4())
 RUNTIME_STARTED_AT = datetime.now(timezone.utc).isoformat()
-SOSYNC_COMPANION_VERSION = os.environ.get("SOSYNC_COMPANION_VERSION", "1.0.19")
-SOSYNC_COMPANION_BUILD = os.environ.get("SOSYNC_COMPANION_BUILD", "1.0.19-secure-remote-status-identity-v1")
+SOSYNC_COMPANION_VERSION = os.environ.get("SOSYNC_COMPANION_VERSION", "1.0.20")
+SOSYNC_COMPANION_BUILD = os.environ.get("SOSYNC_COMPANION_BUILD", "1.0.20-secure-remote-token-format-v1")
 SECURE_REMOTE_TUNNEL_CONFIRMATION_SECONDS = float(os.environ.get("SOSYNC_TUNNEL_CONFIRMATION_SECONDS", "1.0"))
 SECURE_REMOTE_TUNNEL_LOCK = threading.Lock()
 SECURE_REMOTE_TUNNEL_PROCESS = None
@@ -2122,6 +2122,7 @@ def secure_remote_public_status(binding=None):
         "cloudflare_connector_tunnel_id_hash": connector_identity["cloudflare_connector_tunnel_id_hash"],
         "connector_tunnel_identity_available": connector_identity["connector_tunnel_identity_available"],
         "connector_tunnel_identity_failure": connector_identity["connector_tunnel_identity_failure"],
+        "connector_tunnel_token_format": connector_identity["connector_tunnel_token_format"],
         "updated_at": binding.get("updated_at"),
         "revoked_at": binding.get("revoked_at")
     }
@@ -2132,21 +2133,24 @@ def secure_remote_current_process_connector_identity(cloudflared_running):
         return {
             "cloudflare_connector_tunnel_id_hash": "none",
             "connector_tunnel_identity_available": False,
-            "connector_tunnel_identity_failure": "processNotRunning"
+            "connector_tunnel_identity_failure": "processNotRunning",
+            "connector_tunnel_token_format": "unknown"
         }
     identity = SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY if isinstance(SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY, dict) else None
     if not identity:
         return {
             "cloudflare_connector_tunnel_id_hash": "none",
             "connector_tunnel_identity_available": False,
-            "connector_tunnel_identity_failure": "identityNotCaptured"
+            "connector_tunnel_identity_failure": "identityNotCaptured",
+            "connector_tunnel_token_format": "unknown"
         }
     connector_hash = str(identity.get("cloudflare_connector_tunnel_id_hash") or "none").strip() or "none"
     available = bool(identity.get("available"))
     return {
         "cloudflare_connector_tunnel_id_hash": connector_hash,
         "connector_tunnel_identity_available": available,
-        "connector_tunnel_identity_failure": identity.get("failure") or (None if available else "identityUnavailable")
+        "connector_tunnel_identity_failure": identity.get("failure") or (None if available else "identityUnavailable"),
+        "connector_tunnel_token_format": identity.get("connector_token_format") or "unknown"
     }
 
 
@@ -2252,7 +2256,7 @@ def start_secure_remote_tunnel(binding=None):
                 flush=True
             )
             print(
-                f"[SOSYNC-SECURE-REMOTE-IDENTITY] cloudflareConnectorTunnelIDHash={process_identity.get('cloudflare_connector_tunnel_id_hash')} connectorTunnelIdentityAvailable={str(bool(process_identity.get('available'))).lower()} connectorTunnelIdentityFailure={process_identity.get('failure') or 'none'} tunnelManagementMode=remoteManaged effectiveIngressSource=cloudflareApi cloudflaredRunning=true",
+                f"[SOSYNC-SECURE-REMOTE-IDENTITY] cloudflareConnectorTunnelIDHash={process_identity.get('cloudflare_connector_tunnel_id_hash')} connectorTunnelIdentityAvailable={str(bool(process_identity.get('available'))).lower()} connectorTunnelIdentityFailure={process_identity.get('failure') or 'none'} connectorTokenFormat={process_identity.get('connector_token_format') or 'unknown'} tunnelManagementMode=remoteManaged effectiveIngressSource=cloudflareApi cloudflaredRunning=true",
                 flush=True
             )
             return {"running": True, "stage": "confirmed", "reason": None}
@@ -2279,7 +2283,7 @@ def start_secure_remote_tunnel(binding=None):
                 command = [cloudflared_path, "--no-autoupdate", "tunnel", "run", "--token", token]
                 token_identity = decode_cloudflare_connector_token_identity(token)
                 print(
-                    f"[SOSYNC-SECURE-REMOTE-IDENTITY] cloudflareConnectorTunnelIDHash={token_identity.get('cloudflare_connector_tunnel_id_hash')} connectorTunnelIdentityAvailable={str(bool(token_identity.get('available'))).lower()} connectorTunnelIdentityFailure={token_identity.get('failure') or 'none'} tunnelManagementMode=remoteManaged effectiveIngressSource=cloudflareApi cloudflaredRunning=false",
+                    f"[SOSYNC-SECURE-REMOTE-IDENTITY] cloudflareConnectorTunnelIDHash={token_identity.get('cloudflare_connector_tunnel_id_hash')} connectorTunnelIdentityAvailable={str(bool(token_identity.get('available'))).lower()} connectorTunnelIdentityFailure={token_identity.get('failure') or 'none'} connectorTokenFormat={token_identity.get('connector_token_format') or 'unknown'} connectorTokenSegmentCount={token_identity.get('connector_token_segment_count')} connectorTokenDecodedObject={str(bool(token_identity.get('connector_token_decoded_object'))).lower()} connectorTokenDecodedKeys={','.join(token_identity.get('connector_token_decoded_keys') or [])} tunnelManagementMode=remoteManaged effectiveIngressSource=cloudflareApi cloudflaredRunning=false",
                     flush=True
                 )
                 print(
@@ -2323,7 +2327,7 @@ def start_secure_remote_tunnel(binding=None):
                     flush=True
                 )
                 print(
-                    f"[SOSYNC-SECURE-REMOTE-IDENTITY] cloudflareConnectorTunnelIDHash={token_identity.get('cloudflare_connector_tunnel_id_hash')} connectorTunnelIdentityAvailable={str(bool(token_identity.get('available'))).lower()} connectorTunnelIdentityFailure={token_identity.get('failure') or 'none'} tunnelManagementMode=remoteManaged effectiveIngressSource=cloudflareApi cloudflaredRunning=true",
+                    f"[SOSYNC-SECURE-REMOTE-IDENTITY] cloudflareConnectorTunnelIDHash={token_identity.get('cloudflare_connector_tunnel_id_hash')} connectorTunnelIdentityAvailable={str(bool(token_identity.get('available'))).lower()} connectorTunnelIdentityFailure={token_identity.get('failure') or 'none'} connectorTokenFormat={token_identity.get('connector_token_format') or 'unknown'} connectorTokenSegmentCount={token_identity.get('connector_token_segment_count')} connectorTokenDecodedObject={str(bool(token_identity.get('connector_token_decoded_object'))).lower()} connectorTokenDecodedKeys={','.join(token_identity.get('connector_token_decoded_keys') or [])} tunnelManagementMode=remoteManaged effectiveIngressSource=cloudflareApi cloudflaredRunning=true",
                     flush=True
                 )
                 return {"running": True, "stage": "confirmed", "reason": None}
@@ -2384,33 +2388,75 @@ def safe_fingerprint(value):
 
 
 def decode_cloudflare_connector_token_identity(token):
+    classification = classify_cloudflare_connector_token(token)
     try:
-        parts = str(token or "").strip().split(".")
-        if len(parts) != 3:
-            return {
-                "available": False,
-                "failure": "notJWT",
-                "cloudflare_connector_tunnel_id_hash": "none"
-            }
-        payload = json.loads(base64url_decode(parts[1]).decode("utf-8"))
+        payload = decoded_cloudflare_connector_token_payload(token, classification)
+        decoded_keys = safe_json_key_names(payload)
         tunnel_id = first_string_value(payload, ["t", "tunnel_id", "tunnelID", "TunnelID"])
         if not tunnel_id:
             return {
                 "available": False,
                 "failure": "tunnelIDMissing",
-                "cloudflare_connector_tunnel_id_hash": "none"
+                "cloudflare_connector_tunnel_id_hash": "none",
+                "connector_token_format": classification["format"],
+                "connector_token_segment_count": classification["segment_count"],
+                "connector_token_decoded_object": isinstance(payload, dict),
+                "connector_token_decoded_keys": decoded_keys
             }
         return {
             "available": True,
             "failure": None,
-            "cloudflare_connector_tunnel_id_hash": safe_fingerprint(tunnel_id)
+            "cloudflare_connector_tunnel_id_hash": safe_fingerprint(tunnel_id),
+            "connector_token_format": classification["format"],
+            "connector_token_segment_count": classification["segment_count"],
+            "connector_token_decoded_object": True,
+            "connector_token_decoded_keys": decoded_keys
         }
     except Exception:
         return {
             "available": False,
             "failure": "decodeFailed",
-            "cloudflare_connector_tunnel_id_hash": "none"
+            "cloudflare_connector_tunnel_id_hash": "none",
+            "connector_token_format": classification["format"],
+            "connector_token_segment_count": classification["segment_count"],
+            "connector_token_decoded_object": False,
+            "connector_token_decoded_keys": []
         }
+
+
+def classify_cloudflare_connector_token(token):
+    raw = str(token or "").strip()
+    segment_count = len(raw.split(".")) if raw else 0
+    if segment_count == 3:
+        return {"format": "jwtThreeSegment", "segment_count": segment_count}
+    if not raw:
+        return {"format": "unknown", "segment_count": segment_count}
+    if raw.startswith("{"):
+        return {"format": "plainJSON", "segment_count": segment_count}
+    if re.fullmatch(r"[A-Za-z0-9_-]+={0,2}", raw):
+        return {"format": "base64urlJSON", "segment_count": segment_count}
+    if re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", raw):
+        return {"format": "singleBase64", "segment_count": segment_count}
+    return {"format": "unknown", "segment_count": segment_count}
+
+
+def decoded_cloudflare_connector_token_payload(token, classification):
+    raw = str(token or "").strip()
+    token_format = classification.get("format")
+    if token_format == "jwtThreeSegment":
+        parts = raw.split(".")
+        return json.loads(base64url_decode(parts[1]).decode("utf-8"))
+    if token_format == "plainJSON":
+        return json.loads(raw)
+    if token_format in ("singleBase64", "base64urlJSON"):
+        return json.loads(base64url_decode(raw).decode("utf-8"))
+    raise ValueError("unsupportedConnectorTokenFormat")
+
+
+def safe_json_key_names(value):
+    if not isinstance(value, dict):
+        return []
+    return sorted(str(key)[:64] for key in value.keys() if isinstance(key, str))
 
 
 def compare_cloudflare_tunnel_identity(expected_hash, connector_identity):

@@ -150,13 +150,13 @@ class CompanionP03Tests(unittest.TestCase):
         dockerfile = (addon_root / "Dockerfile").read_text(encoding="utf-8")
         runtime = (addon_root / "app.py").read_text(encoding="utf-8")
 
-        self.assertIn('version: "1.0.19"', config)
+        self.assertIn('version: "1.0.20"', config)
         self.assertIn("e2ee_pairing_authorization", config)
         self.assertIn("COPY app.py /app/app.py", dockerfile)
         self.assertIn("CLOUDFLARED_VERSION=2026.8.2", dockerfile)
         self.assertIn("BESMART_CLOUDFLARED_BIN=/usr/local/bin/cloudflared", dockerfile)
-        self.assertIn("SOSYNC_COMPANION_VERSION=1.0.19", dockerfile)
-        self.assertIn("SOSYNC_COMPANION_BUILD=1.0.19-secure-remote-status-identity-v1", dockerfile)
+        self.assertIn("SOSYNC_COMPANION_VERSION=1.0.20", dockerfile)
+        self.assertIn("SOSYNC_COMPANION_BUILD=1.0.20-secure-remote-token-format-v1", dockerfile)
         self.assertIn("/usr/local/bin/cloudflared --version", dockerfile)
         self.assertIn('self.path == "/security/e2ee/identity"', runtime)
         self.assertIn('self.path == "/security/e2ee/pair"', runtime)
@@ -164,7 +164,7 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertIn("tunnelCredentialInstalled", runtime)
         self.assertIn("tunnelProcessStarted", runtime)
         self.assertIn("tunnelProcessFailed", runtime)
-        self.assertIn("1.0.19-secure-remote-status-identity-v1", runtime)
+        self.assertIn("1.0.20-secure-remote-token-format-v1", runtime)
 
     def test_health_and_identity_expose_runtime_build_marker(self):
         with self._server() as base_url:
@@ -173,9 +173,9 @@ class CompanionP03Tests(unittest.TestCase):
 
         self.assertEqual(health_status, 200)
         self.assertEqual(identity_status, 200)
-        self.assertEqual(health["build"], "1.0.19-secure-remote-status-identity-v1")
-        self.assertEqual(identity["build"], "1.0.19-secure-remote-status-identity-v1")
-        self.assertEqual(health["companion_version"], "1.0.19")
+        self.assertEqual(health["build"], "1.0.20-secure-remote-token-format-v1")
+        self.assertEqual(identity["build"], "1.0.20-secure-remote-token-format-v1")
+        self.assertEqual(health["companion_version"], "1.0.20")
         self.assertIn("cloudflared_available", health)
         self.assertIn("cloudflared_running", health)
 
@@ -460,18 +460,45 @@ class CompanionP03Tests(unittest.TestCase):
     def test_cloudflare_connector_token_tunnel_identity_is_extracted_safely(self):
         tunnel_id = "cf_abcdefghijklmnopqrstuvwxyz123456"
         token = self._cloudflare_connector_token(tunnel_id)
+        single_token = self._cloudflare_connector_single_base64url_token(tunnel_id)
+        padded_single_token = single_token + "=" * ((4 - len(single_token) % 4) % 4)
+        plain_json_token = json.dumps({"t": tunnel_id, "s": "secret-not-logged", "a": "account-not-logged"})
         identity = app.decode_cloudflare_connector_token_identity(token)
+        single_identity = app.decode_cloudflare_connector_token_identity(single_token)
+        padded_single_identity = app.decode_cloudflare_connector_token_identity(padded_single_token)
+        plain_json_identity = app.decode_cloudflare_connector_token_identity(plain_json_token)
         malformed = app.decode_cloudflare_connector_token_identity("not-a-token")
         missing = app.decode_cloudflare_connector_token_identity(self._cloudflare_connector_token(None))
+        missing_single = app.decode_cloudflare_connector_token_identity(self._cloudflare_connector_single_base64url_token(None))
 
         self.assertTrue(identity["available"])
         self.assertEqual(identity["failure"], None)
         self.assertEqual(identity["cloudflare_connector_tunnel_id_hash"], app.safe_fingerprint(tunnel_id))
+        self.assertEqual(identity["connector_token_format"], "jwtThreeSegment")
+        self.assertEqual(identity["connector_token_segment_count"], 3)
+        self.assertEqual(identity["connector_token_decoded_keys"], ["a", "s", "t"])
+        self.assertTrue(single_identity["available"])
+        self.assertEqual(single_identity["failure"], None)
+        self.assertEqual(single_identity["cloudflare_connector_tunnel_id_hash"], app.safe_fingerprint(tunnel_id))
+        self.assertEqual(single_identity["connector_token_format"], "base64urlJSON")
+        self.assertEqual(single_identity["connector_token_segment_count"], 1)
+        self.assertEqual(single_identity["connector_token_decoded_keys"], ["a", "s", "t"])
+        self.assertTrue(padded_single_identity["available"])
+        self.assertEqual(padded_single_identity["cloudflare_connector_tunnel_id_hash"], app.safe_fingerprint(tunnel_id))
+        self.assertTrue(plain_json_identity["available"])
+        self.assertEqual(plain_json_identity["connector_token_format"], "plainJSON")
+        self.assertEqual(plain_json_identity["cloudflare_connector_tunnel_id_hash"], app.safe_fingerprint(tunnel_id))
         self.assertFalse(malformed["available"])
-        self.assertEqual(malformed["failure"], "notJWT")
+        self.assertEqual(malformed["failure"], "decodeFailed")
+        self.assertIn(malformed["connector_token_format"], ["base64urlJSON", "unknown"])
         self.assertFalse(missing["available"])
         self.assertEqual(missing["failure"], "tunnelIDMissing")
+        self.assertFalse(missing_single["available"])
+        self.assertEqual(missing_single["failure"], "tunnelIDMissing")
         self.assertNotIn(tunnel_id, json.dumps(identity))
+        self.assertNotIn(tunnel_id, json.dumps(single_identity))
+        self.assertNotIn("secret-not-logged", json.dumps(single_identity))
+        self.assertNotIn("account-not-logged", json.dumps(single_identity))
 
         match = app.compare_cloudflare_tunnel_identity(app.safe_fingerprint(tunnel_id), identity)
         mismatch = app.compare_cloudflare_tunnel_identity(app.safe_fingerprint("other-tunnel"), identity)
@@ -487,7 +514,7 @@ class CompanionP03Tests(unittest.TestCase):
         route_id = "r_abcdefghijklmnopqrstuvwxyz123456"
         tunnel_id = "tun_abcdefghijklmnopqrstuvwxyz123456"
         cloudflare_tunnel_id = "cf_abcdefghijklmnopqrstuvwxyz123456"
-        connector_token = self._cloudflare_connector_token(cloudflare_tunnel_id)
+        connector_token = self._cloudflare_connector_single_base64url_token(cloudflare_tunnel_id)
         self._patch_cloudflared_start(running=True)
         try:
             with self._server() as base_url:
@@ -527,9 +554,11 @@ class CompanionP03Tests(unittest.TestCase):
             self.assertEqual(status["cloudflare_connector_tunnel_id_hash"], expected_hash)
             self.assertTrue(status["connector_tunnel_identity_available"])
             self.assertEqual(status["connector_tunnel_identity_failure"], None)
+            self.assertEqual(status["connector_tunnel_token_format"], "base64urlJSON")
             self.assertEqual(stale_status_code, 200)
             self.assertEqual(stale_status["cloudflare_connector_tunnel_id_hash"], expected_hash)
             self.assertTrue(stale_status["connector_tunnel_identity_available"])
+            self.assertEqual(stale_status["connector_tunnel_token_format"], "base64urlJSON")
             self.assertNotIn(cloudflare_tunnel_id, json.dumps(status))
             self.assertNotIn(cloudflare_tunnel_id, json.dumps(stale_status))
             self.assertNotIn(connector_token, json.dumps(status))
@@ -745,6 +774,7 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertEqual(status["cloudflare_connector_tunnel_id_hash"], "none")
         self.assertFalse(status["connector_tunnel_identity_available"])
         self.assertEqual(status["connector_tunnel_identity_failure"], "processNotRunning")
+        self.assertEqual(status["connector_tunnel_token_format"], "unknown")
 
     def test_secure_remote_tunnel_install_uses_worker_connector_token_mode(self):
         route_id = "r_abcdefghijklmnopqrstuvwxyz123456"
@@ -885,6 +915,10 @@ class CompanionP03Tests(unittest.TestCase):
         payload = {} if tunnel_id is None else {"t": tunnel_id, "s": "secret-not-logged", "a": "account-not-logged"}
         encoded_payload = app.base64url_encode(json.dumps(payload).encode("utf-8"))
         return f"{header}.{encoded_payload}.signature"
+
+    def _cloudflare_connector_single_base64url_token(self, tunnel_id):
+        payload = {} if tunnel_id is None else {"t": tunnel_id, "s": "secret-not-logged", "a": "account-not-logged"}
+        return app.base64url_encode(json.dumps(payload).encode("utf-8"))
 
     def _write_options(self, value):
         Path(app.ADDON_OPTIONS_FILE).write_text(json.dumps(value), encoding="utf-8")
