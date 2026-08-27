@@ -25,6 +25,7 @@ class CompanionP03Tests(unittest.TestCase):
         self.data_dir = self.tmp.name
         self._patch_paths(self.data_dir)
         self._patch_tailscale()
+        app.SECURE_REMOTE_DATAPLANE_SESSIONS.clear()
         os.environ.pop("BESMART_BACKEND_SIGNING_PUBLIC_KEY", None)
 
     def tearDown(self):
@@ -152,13 +153,13 @@ class CompanionP03Tests(unittest.TestCase):
         dockerfile = (addon_root / "Dockerfile").read_text(encoding="utf-8")
         runtime = (addon_root / "app.py").read_text(encoding="utf-8")
 
-        self.assertIn('version: "1.0.23"', config)
+        self.assertIn('version: "1.0.24"', config)
         self.assertIn("e2ee_pairing_authorization", config)
         self.assertIn("COPY app.py /app/app.py", dockerfile)
         self.assertIn("CLOUDFLARED_VERSION=2026.8.2", dockerfile)
         self.assertIn("BESMART_CLOUDFLARED_BIN=/usr/local/bin/cloudflared", dockerfile)
-        self.assertIn("SOSYNC_COMPANION_VERSION=1.0.23", dockerfile)
-        self.assertIn("SOSYNC_COMPANION_BUILD=1.0.23-secure-remote-e2ee-websocket-get-v1", dockerfile)
+        self.assertIn("SOSYNC_COMPANION_VERSION=1.0.24", dockerfile)
+        self.assertIn("SOSYNC_COMPANION_BUILD=1.0.24-secure-remote-e2ee-ws-session-lifecycle-v1", dockerfile)
         self.assertIn("/usr/local/bin/cloudflared --version", dockerfile)
         self.assertIn('self.path == "/security/e2ee/identity"', runtime)
         self.assertIn('self.path == "/security/e2ee/pair"', runtime)
@@ -166,7 +167,7 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertIn("tunnelCredentialInstalled", runtime)
         self.assertIn("tunnelProcessStarted", runtime)
         self.assertIn("tunnelProcessFailed", runtime)
-        self.assertIn("1.0.23-secure-remote-e2ee-websocket-get-v1", runtime)
+        self.assertIn("1.0.24-secure-remote-e2ee-ws-session-lifecycle-v1", runtime)
 
     def test_health_and_identity_expose_runtime_build_marker(self):
         with self._server() as base_url:
@@ -175,9 +176,9 @@ class CompanionP03Tests(unittest.TestCase):
 
         self.assertEqual(health_status, 200)
         self.assertEqual(identity_status, 200)
-        self.assertEqual(health["build"], "1.0.23-secure-remote-e2ee-websocket-get-v1")
-        self.assertEqual(identity["build"], "1.0.23-secure-remote-e2ee-websocket-get-v1")
-        self.assertEqual(health["companion_version"], "1.0.23")
+        self.assertEqual(health["build"], "1.0.24-secure-remote-e2ee-ws-session-lifecycle-v1")
+        self.assertEqual(identity["build"], "1.0.24-secure-remote-e2ee-ws-session-lifecycle-v1")
+        self.assertEqual(health["companion_version"], "1.0.24")
         self.assertIn("cloudflared_available", health)
         self.assertIn("cloudflared_running", health)
 
@@ -452,6 +453,36 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertEqual(status, 403)
         self.assertEqual(body["error"], "encrypted_session_required")
         self.assertNotEqual(status, 404)
+
+    def test_secure_remote_websocket_session_lookup_does_not_expire_valid_open_socket_at_60_seconds(self):
+        binding = {"route_id": "r_abcdefghijklmnopqrstuvwxyz123456", "status": "active"}
+        expired_open_websocket_session = {
+            "session_id": "session-for-open-websocket",
+            "route_id": binding["route_id"],
+            "device_id": "device-1",
+            "expires_at": time.time() - 1,
+            "highest_client_sequence": 0,
+            "next_companion_sequence": 1
+        }
+        key = (binding["route_id"], expired_open_websocket_session["session_id"])
+
+        app.SECURE_REMOTE_DATAPLANE_SESSIONS[key] = dict(expired_open_websocket_session)
+        self.assertIsNotNone(
+            app.secure_remote_dataplane_session(
+                binding,
+                expired_open_websocket_session["session_id"],
+                enforce_expiry=False
+            )
+        )
+
+        app.SECURE_REMOTE_DATAPLANE_SESSIONS[key] = dict(expired_open_websocket_session)
+        self.assertIsNone(
+            app.secure_remote_dataplane_session(
+                binding,
+                expired_open_websocket_session["session_id"],
+                enforce_expiry=True
+            )
+        )
 
     def test_secure_remote_protected_endpoints_remain_authorized_and_unknown_path_is_marked(self):
         route_id = "r_abcdefghijklmnopqrstuvwxyz123456"

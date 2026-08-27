@@ -67,8 +67,8 @@ SETUP_PACKAGE_ENCRYPTION_ALG = "HPKE-X25519-HKDF-SHA256-CHACHA20-POLY1305"
 SETUP_PACKAGE_SIGNATURE_ALG = "Ed25519"
 RUNTIME_INSTANCE_ID = str(uuid.uuid4())
 RUNTIME_STARTED_AT = datetime.now(timezone.utc).isoformat()
-SOSYNC_COMPANION_VERSION = os.environ.get("SOSYNC_COMPANION_VERSION", "1.0.23")
-SOSYNC_COMPANION_BUILD = os.environ.get("SOSYNC_COMPANION_BUILD", "1.0.23-secure-remote-e2ee-websocket-get-v1")
+SOSYNC_COMPANION_VERSION = os.environ.get("SOSYNC_COMPANION_VERSION", "1.0.24")
+SOSYNC_COMPANION_BUILD = os.environ.get("SOSYNC_COMPANION_BUILD", "1.0.24-secure-remote-e2ee-ws-session-lifecycle-v1")
 SECURE_REMOTE_TUNNEL_CONFIRMATION_SECONDS = float(os.environ.get("SOSYNC_TUNNEL_CONFIRMATION_SECONDS", "1.0"))
 SECURE_REMOTE_TUNNEL_LOCK = threading.Lock()
 SECURE_REMOTE_TUNNEL_PROCESS = None
@@ -1490,11 +1490,11 @@ def create_secure_remote_dataplane_session(binding, request):
     return session
 
 
-def secure_remote_dataplane_session(binding, session_id):
+def secure_remote_dataplane_session(binding, session_id, enforce_expiry=True):
     key = (binding.get("route_id"), str(session_id or ""))
     with SECURE_REMOTE_DATAPLANE_LOCK:
         session = SECURE_REMOTE_DATAPLANE_SESSIONS.get(key)
-        if not session or session.get("expires_at", 0) < time.time():
+        if not session or (enforce_expiry and session.get("expires_at", 0) < time.time()):
             SECURE_REMOTE_DATAPLANE_SESSIONS.pop(key, None)
             return None
         return session
@@ -1527,8 +1527,8 @@ def secure_remote_dataplane_aad(route_id, session_id, device_id, direction, sequ
     return f"v=1|route={route_id}|session={session_id}|device={device_id}|direction={direction}|sequence={sequence}|message={message_id}".encode("utf-8")
 
 
-def decrypt_secure_remote_dataplane_envelope(binding, envelope, expected_direction):
-    session = secure_remote_dataplane_session(binding, envelope.get("session_id"))
+def decrypt_secure_remote_dataplane_envelope(binding, envelope, expected_direction, enforce_expiry=True):
+    session = secure_remote_dataplane_session(binding, envelope.get("session_id"), enforce_expiry=enforce_expiry)
     if not session:
         raise ValueError("encrypted_session_required")
     if (
@@ -1551,8 +1551,8 @@ def decrypt_secure_remote_dataplane_envelope(binding, envelope, expected_directi
     return plaintext
 
 
-def encrypt_secure_remote_dataplane_envelope(binding, session_id, plaintext, direction, message_id):
-    session = secure_remote_dataplane_session(binding, session_id)
+def encrypt_secure_remote_dataplane_envelope(binding, session_id, plaintext, direction, message_id, enforce_expiry=True):
+    session = secure_remote_dataplane_session(binding, session_id, enforce_expiry=enforce_expiry)
     if not session:
         raise ValueError("encrypted_session_required")
     sequence = int(session.get("next_companion_sequence") or 1)
@@ -1603,29 +1603,33 @@ def perform_secure_remote_dataplane_rest(method, ha_path, headers, body_base64ur
 
 def bridge_secure_remote_dataplane_websocket(client_socket, upstream_socket, binding, session_id):
     sockets = [client_socket, upstream_socket]
-    while True:
-        current_binding = read_secure_remote_binding()
-        if current_binding.get("status") == "revoked" or not secure_remote_dataplane_session(binding, session_id):
-            print(
-                f"[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionEncryptedWebSocketRevocationClosed route={safe_fingerprint(binding.get('route_id'))} maxRevocationEnforcementSeconds=60",
-                flush=True
-            )
-            return
-        readable, _, _ = select.select(sockets, [], [], 0.5)
-        for source in readable:
-            if source is client_socket:
-                opcode, payload = read_websocket_frame(client_socket)
-                if opcode in (0x8, None):
-                    return
-                envelope = json.loads(payload.decode("utf-8"))
-                plaintext = decrypt_secure_remote_dataplane_envelope(binding, envelope, "client_to_companion")
-                write_websocket_frame(upstream_socket, 0x1, plaintext, mask=False)
-            else:
-                opcode, payload = read_websocket_frame(upstream_socket)
-                if opcode in (0x8, None):
-                    return
-                envelope = encrypt_secure_remote_dataplane_envelope(binding, session_id, payload, "companion_to_client", f"ws-event-{uuid.uuid4()}")
-                write_websocket_frame(client_socket, 0x1, json.dumps(envelope, separators=(",", ":")).encode("utf-8"), mask=False)
+    try:
+        while True:
+            current_binding = read_secure_remote_binding()
+            if current_binding.get("status") == "revoked" or not secure_remote_dataplane_session(binding, session_id, enforce_expiry=False):
+                print(
+                    f"[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionEncryptedWebSocketRevocationClosed route={safe_fingerprint(binding.get('route_id'))} maxRevocationEnforcementSeconds=60",
+                    flush=True
+                )
+                return
+            readable, _, _ = select.select(sockets, [], [], 0.5)
+            for source in readable:
+                if source is client_socket:
+                    opcode, payload = read_websocket_frame(client_socket)
+                    if opcode in (0x8, None):
+                        return
+                    envelope = json.loads(payload.decode("utf-8"))
+                    plaintext = decrypt_secure_remote_dataplane_envelope(binding, envelope, "client_to_companion", enforce_expiry=False)
+                    write_websocket_frame(upstream_socket, 0x1, plaintext, mask=False)
+                else:
+                    opcode, payload = read_websocket_frame(upstream_socket)
+                    if opcode in (0x8, None):
+                        return
+                    envelope = encrypt_secure_remote_dataplane_envelope(binding, session_id, payload, "companion_to_client", f"ws-event-{uuid.uuid4()}", enforce_expiry=False)
+                    write_websocket_frame(client_socket, 0x1, json.dumps(envelope, separators=(",", ":")).encode("utf-8"), mask=False)
+    finally:
+        with SECURE_REMOTE_DATAPLANE_LOCK:
+            SECURE_REMOTE_DATAPLANE_SESSIONS.pop((binding.get("route_id"), str(session_id or "")), None)
 
 
 def read_websocket_frame(sock):

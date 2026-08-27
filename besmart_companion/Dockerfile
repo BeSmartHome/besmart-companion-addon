@@ -3,8 +3,8 @@ FROM alpine:3.22
 ARG TARGETARCH
 ARG CLOUDFLARED_VERSION=2026.8.2
 ENV BESMART_CLOUDFLARED_BIN=/usr/local/bin/cloudflared
-ENV SOSYNC_COMPANION_VERSION=1.0.23
-ENV SOSYNC_COMPANION_BUILD=1.0.23-secure-remote-e2ee-websocket-get-v1
+ENV SOSYNC_COMPANION_VERSION=1.0.24
+ENV SOSYNC_COMPANION_BUILD=1.0.24-secure-remote-e2ee-ws-session-lifecycle-v1
 
 RUN apk add --no-cache \
     python3 \
