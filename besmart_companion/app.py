@@ -67,8 +67,8 @@ SETUP_PACKAGE_ENCRYPTION_ALG = "HPKE-X25519-HKDF-SHA256-CHACHA20-POLY1305"
 SETUP_PACKAGE_SIGNATURE_ALG = "Ed25519"
 RUNTIME_INSTANCE_ID = str(uuid.uuid4())
 RUNTIME_STARTED_AT = datetime.now(timezone.utc).isoformat()
-SOSYNC_COMPANION_VERSION = os.environ.get("SOSYNC_COMPANION_VERSION", "1.0.24")
-SOSYNC_COMPANION_BUILD = os.environ.get("SOSYNC_COMPANION_BUILD", "1.0.24-secure-remote-e2ee-ws-session-lifecycle-v1")
+SOSYNC_COMPANION_VERSION = os.environ.get("SOSYNC_COMPANION_VERSION", "1.0.25")
+SOSYNC_COMPANION_BUILD = os.environ.get("SOSYNC_COMPANION_BUILD", "1.0.25-secure-remote-e2ee-ws-control-frame-v1")
 SECURE_REMOTE_TUNNEL_CONFIRMATION_SECONDS = float(os.environ.get("SOSYNC_TUNNEL_CONFIRMATION_SECONDS", "1.0"))
 SECURE_REMOTE_TUNNEL_LOCK = threading.Lock()
 SECURE_REMOTE_TUNNEL_PROCESS = None
@@ -1575,6 +1575,37 @@ def encrypt_secure_remote_dataplane_envelope(binding, session_id, plaintext, dir
     }
 
 
+def websocket_opcode_class(opcode):
+    if opcode == 0x0:
+        return "continuation"
+    if opcode == 0x1:
+        return "text"
+    if opcode == 0x2:
+        return "binary"
+    if opcode == 0x8:
+        return "close"
+    if opcode == 0x9:
+        return "ping"
+    if opcode == 0xA:
+        return "pong"
+    if opcode is None:
+        return "none"
+    return "unsupported"
+
+
+def log_encrypted_websocket_outbound(binding, session_id, opcode, plaintext_bytes, envelope=None, envelope_bytes=0, classification="data"):
+    sequence = envelope.get("sequence") if isinstance(envelope, dict) else "none"
+    envelope_version = envelope.get("protocol_version") if isinstance(envelope, dict) else "none"
+    print(
+        "[SOSYNC-SECURE-REMOTE-DATAPLANE] "
+        f"event=encryptedWebSocketOutbound messageType={websocket_opcode_class(opcode)} "
+        f"envelopeVersion={envelope_version} session={safe_fingerprint(session_id)} "
+        f"sequence={sequence} plaintextBytes={plaintext_bytes} envelopeBytes={envelope_bytes} "
+        f"classification={classification}",
+        flush=True
+    )
+
+
 def perform_secure_remote_dataplane_rest(method, ha_path, headers, body_base64url):
     target_url = f"{read_ha_upstream()}{ha_path}"
     request_body = base64url_decode(body_base64url) if body_base64url else None
@@ -1618,6 +1649,13 @@ def bridge_secure_remote_dataplane_websocket(client_socket, upstream_socket, bin
                     opcode, payload = read_websocket_frame(client_socket)
                     if opcode in (0x8, None):
                         return
+                    if opcode == 0x9:
+                        write_websocket_frame(client_socket, 0xA, payload, mask=False)
+                        continue
+                    if opcode == 0xA:
+                        continue
+                    if opcode != 0x1:
+                        raise ValueError(f"unsupported_client_websocket_opcode_{websocket_opcode_class(opcode)}")
                     envelope = json.loads(payload.decode("utf-8"))
                     plaintext = decrypt_secure_remote_dataplane_envelope(binding, envelope, "client_to_companion", enforce_expiry=False)
                     write_websocket_frame(upstream_socket, 0x1, plaintext, mask=False)
@@ -1625,8 +1663,20 @@ def bridge_secure_remote_dataplane_websocket(client_socket, upstream_socket, bin
                     opcode, payload = read_websocket_frame(upstream_socket)
                     if opcode in (0x8, None):
                         return
+                    if opcode == 0x9:
+                        log_encrypted_websocket_outbound(binding, session_id, opcode, len(payload), classification="heartbeatSkipped")
+                        write_websocket_frame(upstream_socket, 0xA, payload, mask=False)
+                        continue
+                    if opcode == 0xA:
+                        log_encrypted_websocket_outbound(binding, session_id, opcode, len(payload), classification="heartbeatSkipped")
+                        continue
+                    if opcode != 0x1:
+                        log_encrypted_websocket_outbound(binding, session_id, opcode, len(payload), classification="unsupportedControl")
+                        raise ValueError(f"unsupported_upstream_websocket_opcode_{websocket_opcode_class(opcode)}")
                     envelope = encrypt_secure_remote_dataplane_envelope(binding, session_id, payload, "companion_to_client", f"ws-event-{uuid.uuid4()}", enforce_expiry=False)
-                    write_websocket_frame(client_socket, 0x1, json.dumps(envelope, separators=(",", ":")).encode("utf-8"), mask=False)
+                    envelope_bytes = json.dumps(envelope, separators=(",", ":")).encode("utf-8")
+                    log_encrypted_websocket_outbound(binding, session_id, opcode, len(payload), envelope=envelope, envelope_bytes=len(envelope_bytes), classification="data")
+                    write_websocket_frame(client_socket, 0x1, envelope_bytes, mask=False)
     finally:
         with SECURE_REMOTE_DATAPLANE_LOCK:
             SECURE_REMOTE_DATAPLANE_SESSIONS.pop((binding.get("route_id"), str(session_id or "")), None)

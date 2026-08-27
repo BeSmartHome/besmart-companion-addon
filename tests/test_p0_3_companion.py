@@ -1,5 +1,6 @@
 import json
 import os
+import socket
 import contextlib
 import io
 import tempfile
@@ -153,13 +154,13 @@ class CompanionP03Tests(unittest.TestCase):
         dockerfile = (addon_root / "Dockerfile").read_text(encoding="utf-8")
         runtime = (addon_root / "app.py").read_text(encoding="utf-8")
 
-        self.assertIn('version: "1.0.24"', config)
+        self.assertIn('version: "1.0.25"', config)
         self.assertIn("e2ee_pairing_authorization", config)
         self.assertIn("COPY app.py /app/app.py", dockerfile)
         self.assertIn("CLOUDFLARED_VERSION=2026.8.2", dockerfile)
         self.assertIn("BESMART_CLOUDFLARED_BIN=/usr/local/bin/cloudflared", dockerfile)
-        self.assertIn("SOSYNC_COMPANION_VERSION=1.0.24", dockerfile)
-        self.assertIn("SOSYNC_COMPANION_BUILD=1.0.24-secure-remote-e2ee-ws-session-lifecycle-v1", dockerfile)
+        self.assertIn("SOSYNC_COMPANION_VERSION=1.0.25", dockerfile)
+        self.assertIn("SOSYNC_COMPANION_BUILD=1.0.25-secure-remote-e2ee-ws-control-frame-v1", dockerfile)
         self.assertIn("/usr/local/bin/cloudflared --version", dockerfile)
         self.assertIn('self.path == "/security/e2ee/identity"', runtime)
         self.assertIn('self.path == "/security/e2ee/pair"', runtime)
@@ -167,7 +168,7 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertIn("tunnelCredentialInstalled", runtime)
         self.assertIn("tunnelProcessStarted", runtime)
         self.assertIn("tunnelProcessFailed", runtime)
-        self.assertIn("1.0.24-secure-remote-e2ee-ws-session-lifecycle-v1", runtime)
+        self.assertIn("1.0.25-secure-remote-e2ee-ws-control-frame-v1", runtime)
 
     def test_health_and_identity_expose_runtime_build_marker(self):
         with self._server() as base_url:
@@ -176,9 +177,9 @@ class CompanionP03Tests(unittest.TestCase):
 
         self.assertEqual(health_status, 200)
         self.assertEqual(identity_status, 200)
-        self.assertEqual(health["build"], "1.0.24-secure-remote-e2ee-ws-session-lifecycle-v1")
-        self.assertEqual(identity["build"], "1.0.24-secure-remote-e2ee-ws-session-lifecycle-v1")
-        self.assertEqual(health["companion_version"], "1.0.24")
+        self.assertEqual(health["build"], "1.0.25-secure-remote-e2ee-ws-control-frame-v1")
+        self.assertEqual(identity["build"], "1.0.25-secure-remote-e2ee-ws-control-frame-v1")
+        self.assertEqual(health["companion_version"], "1.0.25")
         self.assertIn("cloudflared_available", health)
         self.assertIn("cloudflared_running", health)
 
@@ -483,6 +484,111 @@ class CompanionP03Tests(unittest.TestCase):
                 enforce_expiry=True
             )
         )
+
+    def test_secure_remote_websocket_upstream_ping_is_not_forwarded_as_encrypted_ha_payload(self):
+        binding = {"route_id": "r_abcdefghijklmnopqrstuvwxyz123456", "status": "active"}
+        session_id = "session-control-frame"
+        app.SECURE_REMOTE_DATAPLANE_SESSIONS[(binding["route_id"], session_id)] = {
+            "session_id": session_id,
+            "route_id": binding["route_id"],
+            "device_id": "device-1",
+            "expires_at": time.time() + 60,
+            "highest_client_sequence": 0,
+            "next_companion_sequence": 1
+        }
+        client_peer, client_bridge = socket.socketpair()
+        upstream_peer, upstream_bridge = socket.socketpair()
+        client_peer.settimeout(0.2)
+        upstream_peer.settimeout(2)
+        captured = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(captured):
+                thread = threading.Thread(
+                    target=app.bridge_secure_remote_dataplane_websocket,
+                    args=(client_bridge, upstream_bridge, binding, session_id),
+                    daemon=True
+                )
+                thread.start()
+                app.write_websocket_frame(upstream_peer, 0x9, b"", mask=False)
+                opcode, payload = app.read_websocket_frame(upstream_peer)
+                self.assertEqual(opcode, 0xA)
+                self.assertEqual(payload, b"")
+                with self.assertRaises(socket.timeout):
+                    client_peer.recv(2)
+                app.write_websocket_frame(upstream_peer, 0x8, b"", mask=False)
+                thread.join(timeout=2)
+        finally:
+            for sock in (client_peer, client_bridge, upstream_peer, upstream_bridge):
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+        logs = captured.getvalue()
+        self.assertIn("event=encryptedWebSocketOutbound messageType=ping", logs)
+        self.assertIn("classification=heartbeatSkipped", logs)
+        self.assertNotIn("classification=data", logs)
+
+    def test_secure_remote_websocket_upstream_text_is_valid_companion_to_client_envelope(self):
+        binding = {"route_id": "r_abcdefghijklmnopqrstuvwxyz123456", "status": "active"}
+        session_id = "session-data-frame"
+        session = {
+            "session_id": session_id,
+            "route_id": binding["route_id"],
+            "device_id": "device-1",
+            "companion_key": b"1" * 32,
+            "client_key": b"2" * 32,
+            "expires_at": time.time() + 60,
+            "highest_client_sequence": 0,
+            "next_companion_sequence": 1
+        }
+        app.SECURE_REMOTE_DATAPLANE_SESSIONS[(binding["route_id"], session_id)] = session
+        client_peer, client_bridge = socket.socketpair()
+        upstream_peer, upstream_bridge = socket.socketpair()
+        client_peer.settimeout(2)
+        captured = io.StringIO()
+        ha_payload = b'{"type":"event","id":1}'
+        try:
+            with contextlib.redirect_stdout(captured):
+                thread = threading.Thread(
+                    target=app.bridge_secure_remote_dataplane_websocket,
+                    args=(client_bridge, upstream_bridge, binding, session_id),
+                    daemon=True
+                )
+                thread.start()
+                app.write_websocket_frame(upstream_peer, 0x1, ha_payload, mask=False)
+                opcode, payload = app.read_websocket_frame(client_peer)
+                self.assertEqual(opcode, 0x1)
+                envelope = json.loads(payload.decode("utf-8"))
+                self.assertEqual(envelope["protocol_version"], 1)
+                self.assertEqual(envelope["direction"], "companion_to_client")
+                self.assertEqual(envelope["sequence"], 1)
+                nonce = app.base64url_decode(envelope["nonce"])
+                ciphertext = app.base64url_decode(envelope["ciphertext"])
+                aad = app.secure_remote_dataplane_aad(
+                    binding["route_id"],
+                    session_id,
+                    session["device_id"],
+                    "companion_to_client",
+                    envelope["sequence"],
+                    envelope["message_id"]
+                )
+                plaintext = app.ChaCha20Poly1305(session["companion_key"]).decrypt(nonce, ciphertext, aad)
+                self.assertEqual(plaintext, ha_payload)
+                app.write_websocket_frame(upstream_peer, 0x8, b"", mask=False)
+                thread.join(timeout=2)
+        finally:
+            for sock in (client_peer, client_bridge, upstream_peer, upstream_bridge):
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+        logs = captured.getvalue()
+        self.assertIn("event=encryptedWebSocketOutbound messageType=text", logs)
+        self.assertIn("envelopeVersion=1", logs)
+        self.assertIn("sequence=1", logs)
+        self.assertIn("classification=data", logs)
 
     def test_secure_remote_protected_endpoints_remain_authorized_and_unknown_path_is_marked(self):
         route_id = "r_abcdefghijklmnopqrstuvwxyz123456"
