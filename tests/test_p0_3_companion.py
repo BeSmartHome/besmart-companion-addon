@@ -152,13 +152,13 @@ class CompanionP03Tests(unittest.TestCase):
         dockerfile = (addon_root / "Dockerfile").read_text(encoding="utf-8")
         runtime = (addon_root / "app.py").read_text(encoding="utf-8")
 
-        self.assertIn('version: "1.0.21"', config)
+        self.assertIn('version: "1.0.22"', config)
         self.assertIn("e2ee_pairing_authorization", config)
         self.assertIn("COPY app.py /app/app.py", dockerfile)
         self.assertIn("CLOUDFLARED_VERSION=2026.8.2", dockerfile)
         self.assertIn("BESMART_CLOUDFLARED_BIN=/usr/local/bin/cloudflared", dockerfile)
-        self.assertIn("SOSYNC_COMPANION_VERSION=1.0.21", dockerfile)
-        self.assertIn("SOSYNC_COMPANION_BUILD=1.0.21-secure-remote-method-parity-v1", dockerfile)
+        self.assertIn("SOSYNC_COMPANION_VERSION=1.0.22", dockerfile)
+        self.assertIn("SOSYNC_COMPANION_BUILD=1.0.22-secure-remote-e2ee-dataplane-v1", dockerfile)
         self.assertIn("/usr/local/bin/cloudflared --version", dockerfile)
         self.assertIn('self.path == "/security/e2ee/identity"', runtime)
         self.assertIn('self.path == "/security/e2ee/pair"', runtime)
@@ -166,7 +166,7 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertIn("tunnelCredentialInstalled", runtime)
         self.assertIn("tunnelProcessStarted", runtime)
         self.assertIn("tunnelProcessFailed", runtime)
-        self.assertIn("1.0.21-secure-remote-method-parity-v1", runtime)
+        self.assertIn("1.0.22-secure-remote-e2ee-dataplane-v1", runtime)
 
     def test_health_and_identity_expose_runtime_build_marker(self):
         with self._server() as base_url:
@@ -175,9 +175,9 @@ class CompanionP03Tests(unittest.TestCase):
 
         self.assertEqual(health_status, 200)
         self.assertEqual(identity_status, 200)
-        self.assertEqual(health["build"], "1.0.21-secure-remote-method-parity-v1")
-        self.assertEqual(identity["build"], "1.0.21-secure-remote-method-parity-v1")
-        self.assertEqual(health["companion_version"], "1.0.21")
+        self.assertEqual(health["build"], "1.0.22-secure-remote-e2ee-dataplane-v1")
+        self.assertEqual(identity["build"], "1.0.22-secure-remote-e2ee-dataplane-v1")
+        self.assertEqual(health["companion_version"], "1.0.22")
         self.assertIn("cloudflared_available", health)
         self.assertIn("cloudflared_running", health)
 
@@ -318,7 +318,7 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertEqual(replay_status, 409)
         self.assertEqual(connect_replay_status, 409)
 
-    def test_existing_remote_token_proxy_behavior_unchanged(self):
+    def test_existing_remote_token_proxy_is_disabled(self):
         Path(app.REMOTE_TOKEN_FILE).write_text("expected-token", encoding="utf-8")
         with self._server() as base_url:
             unauthorized, _ = self._request_json("GET", base_url, "/remote/ha/api/states")
@@ -329,10 +329,9 @@ class CompanionP03Tests(unittest.TestCase):
                 headers={"X-BeSmart-Remote-Token": "expected-token"}
             )
 
-        self.assertEqual(unauthorized, 401)
-        self.assertIn(authorized, (200, 502))
-        if authorized == 200:
-            self.assertIsInstance(body, dict)
+        self.assertEqual(unauthorized, 410)
+        self.assertEqual(authorized, 410)
+        self.assertEqual(body["error"], "legacy_remote_disabled")
 
     def test_secure_remote_control_plane_persists_metadata_without_exposing_credentials(self):
         route_id = "r_abcdefghijklmnopqrstuvwxyz123456"

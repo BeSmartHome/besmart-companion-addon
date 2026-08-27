@@ -17,7 +17,7 @@ import uuid
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
@@ -30,6 +30,7 @@ from cryptography.hazmat.primitives.serialization import (
     load_der_private_key,
     load_der_public_key,
 )
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.exceptions import InvalidSignature
 from pyhpke import AEADId, CipherSuite, KDFId, KEMId
 
@@ -66,12 +67,14 @@ SETUP_PACKAGE_ENCRYPTION_ALG = "HPKE-X25519-HKDF-SHA256-CHACHA20-POLY1305"
 SETUP_PACKAGE_SIGNATURE_ALG = "Ed25519"
 RUNTIME_INSTANCE_ID = str(uuid.uuid4())
 RUNTIME_STARTED_AT = datetime.now(timezone.utc).isoformat()
-SOSYNC_COMPANION_VERSION = os.environ.get("SOSYNC_COMPANION_VERSION", "1.0.21")
-SOSYNC_COMPANION_BUILD = os.environ.get("SOSYNC_COMPANION_BUILD", "1.0.21-secure-remote-method-parity-v1")
+SOSYNC_COMPANION_VERSION = os.environ.get("SOSYNC_COMPANION_VERSION", "1.0.22")
+SOSYNC_COMPANION_BUILD = os.environ.get("SOSYNC_COMPANION_BUILD", "1.0.22-secure-remote-e2ee-dataplane-v1")
 SECURE_REMOTE_TUNNEL_CONFIRMATION_SECONDS = float(os.environ.get("SOSYNC_TUNNEL_CONFIRMATION_SECONDS", "1.0"))
 SECURE_REMOTE_TUNNEL_LOCK = threading.Lock()
 SECURE_REMOTE_TUNNEL_PROCESS = None
 SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY = None
+SECURE_REMOTE_DATAPLANE_SESSIONS = {}
+SECURE_REMOTE_DATAPLANE_LOCK = threading.Lock()
 print(
     f"[SOSYNC-E2EE-COMPANION] runtimeGlobalsInitialized runtimeInstance={RUNTIME_INSTANCE_ID} build={SOSYNC_COMPANION_BUILD}",
     flush=True
@@ -431,6 +434,18 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_secure_remote_dataplane_health()
             return True
 
+        if request_path == "/secure-remote/data-plane/e2ee/session":
+            self._handle_secure_remote_dataplane_session()
+            return True
+
+        if request_path == "/secure-remote/data-plane/e2ee/rest":
+            self._handle_secure_remote_dataplane_rest()
+            return True
+
+        if request_path == "/secure-remote/data-plane/e2ee/ws":
+            self._handle_secure_remote_dataplane_websocket()
+            return True
+
         if request_path.startswith("/secure-remote/data-plane/ha"):
             self._proxy_secure_remote_home_assistant()
             return True
@@ -636,6 +651,91 @@ class Handler(BaseHTTPRequestHandler):
             })
             return None
         return binding
+
+    def _handle_secure_remote_dataplane_session(self):
+        binding = self._authorize_secure_remote_dataplane()
+        if not binding:
+            return
+        try:
+            data = self._read_json_body(16 * 1024)
+            session = create_secure_remote_dataplane_session(binding, data)
+            print(
+                f"[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionEncryptedSessionReady route={safe_fingerprint(binding.get('route_id'))} session={safe_fingerprint(session['session_id'])} encryptedDataPlane=true companionDecryption=true replayProtection=true maxRevocationEnforcementSeconds=60",
+                flush=True
+            )
+            self._json(200, {
+                "protocol_version": 1,
+                "route_id": binding.get("route_id"),
+                "session_id": session["session_id"],
+                "companion_ephemeral_public_key": session["companion_ephemeral_public_key"],
+                "expires_in_seconds": session["expires_in_seconds"]
+            })
+        except ValueError as error:
+            self._json(400, {"error": str(error)})
+        except Exception as error:
+            print(f"[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionEncryptedSessionRejected reason={type(error).__name__}", flush=True)
+            self._json(403, {"error": "encrypted_session_rejected"})
+
+    def _handle_secure_remote_dataplane_rest(self):
+        binding = self._authorize_secure_remote_dataplane()
+        if not binding:
+            return
+        try:
+            envelope = self._read_json_body(256 * 1024)
+            plain = decrypt_secure_remote_dataplane_envelope(binding, envelope, "client_to_companion")
+            request = json.loads(plain.decode("utf-8"))
+            ha_path = str(request.get("path") or "/")
+            method = str(request.get("method") or "GET").upper()
+            if not is_allowed_ha_path(ha_path) and not (ha_path == "/auth/token" and method == "POST"):
+                self._json(403, {"error": "route_not_allowed"})
+                return
+            response = perform_secure_remote_dataplane_rest(method, ha_path, request.get("headers") or {}, request.get("body_base64url"))
+            response_plain = json.dumps(response, separators=(",", ":")).encode("utf-8")
+            response_envelope = encrypt_secure_remote_dataplane_envelope(binding, envelope.get("session_id"), response_plain, "companion_to_client", f"rest-response-{uuid.uuid4()}")
+            print(
+                f"[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionEncryptedRESTComplete route={safe_fingerprint(binding.get('route_id'))} pathClass={ha_path_class_for_log(ha_path)} upstreamStatus={response.get('status')} companionDecryption=true plaintextHATokenAtWorker=false",
+                flush=True
+            )
+            self._json(200, response_envelope)
+        except Exception as error:
+            print(f"[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionEncryptedRESTRejected reason={type(error).__name__}", flush=True)
+            self._json(403, {"error": "encrypted_dataplane_rejected"})
+
+    def _handle_secure_remote_dataplane_websocket(self):
+        binding = self._authorize_secure_remote_dataplane()
+        if not binding:
+            return
+        if not is_websocket_upgrade(self.headers):
+            self._json(400, {"error": "websocket_upgrade_required"})
+            return
+        session_id = parse_qs(urlparse(self.path).query).get("session_id", [""])[0]
+        if not secure_remote_dataplane_session(binding, session_id):
+            self._json(403, {"error": "encrypted_session_required"})
+            return
+        upstream = urlparse(read_ha_upstream())
+        upstream_host = upstream.hostname or "127.0.0.1"
+        upstream_port = upstream.port or 8123
+        try:
+            with socket.create_connection((upstream_host, upstream_port), timeout=10) as upstream_socket:
+                upstream_socket.settimeout(None)
+                self.connection.settimeout(None)
+                upstream_socket.sendall(self._websocket_upgrade_request("/api/websocket", upstream_host, upstream_port))
+                response = read_http_headers(upstream_socket)
+                if not response or not response.startswith((b"HTTP/1.1 101", b"HTTP/1.0 101")):
+                    self._json(502, {"error": "websocket_upstream_rejected"})
+                    return
+                self.connection.sendall(response)
+                print(
+                    f"[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionEncryptedWebSocketConnected route={safe_fingerprint(binding.get('route_id'))} encryptedDataPlane=true companionDecryption=true",
+                    flush=True
+                )
+                bridge_secure_remote_dataplane_websocket(self.connection, upstream_socket, binding, session_id)
+        except Exception as error:
+            print(f"[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionEncryptedWebSocketClosed reason={type(error).__name__}", flush=True)
+            try:
+                self._json(502, {"error": "encrypted_websocket_failed"})
+            except Exception:
+                pass
 
     def _handle_secure_remote_dataplane_health(self):
         request_path = urlparse(self.path).path
@@ -1107,6 +1207,9 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def _proxy_home_assistant(self):
+        print("[SOSYNC-SECURE-REMOTE-DATAPLANE] event=legacyRemoteProxyRejected legacyRemoteDataPlaneEnabled=false", flush=True)
+        self._json(410, {"error": "legacy_remote_disabled"})
+        return
         stored_token = read_remote_token()
         request_token = self.headers.get(REMOTE_TOKEN_HEADER)
         if not stored_token or not request_token or request_token != stored_token:
@@ -1128,6 +1231,9 @@ class Handler(BaseHTTPRequestHandler):
         self._proxy_home_assistant_path(ha_path, parsed_remote_path.query)
 
     def _proxy_signed_home_assistant(self):
+        print("[SOSYNC-SECURE-REMOTE-DATAPLANE] event=legacySignedRemoteProxyRejected legacyRemoteDataPlaneEnabled=false", flush=True)
+        self._json(410, {"error": "legacy_remote_disabled"})
+        return
         parsed_remote_path = urlparse(self.path)
         signed_route = validate_signed_remote_route(parsed_remote_path.path)
         if not signed_route.get("ok"):
@@ -1329,6 +1435,243 @@ class Handler(BaseHTTPRequestHandler):
             return True
 
         return is_local_client(self.client_address[0])
+
+
+def create_secure_remote_dataplane_session(binding, request):
+    if request.get("protocol_version") != 1:
+        raise ValueError("unsupported_protocol_version")
+    route_id = str(request.get("route_id") or "")
+    session_id = str(request.get("session_id") or "")
+    device_id = str(request.get("device_id") or "")
+    home_id = str(request.get("home_id") or "")
+    device_public_key = normalized_e2ee_public_key(request.get("device_public_key"))
+    device_ephemeral_public_key = normalized_e2ee_public_key(request.get("device_ephemeral_public_key"))
+    if route_id != binding.get("route_id") or not session_id or not device_id or not device_public_key or not device_ephemeral_public_key:
+        raise ValueError("invalid_dataplane_session")
+
+    pairings = read_e2ee_pairings().get("devices", {})
+    pairing = pairings.get(device_id)
+    identity = ensure_e2ee_identity()
+    if not pairing or pairing.get("status") != "active":
+        raise ValueError("pairing_not_active")
+    if pairing.get("home_id") != home_id or pairing.get("device_public_key") != device_public_key:
+        raise ValueError("pairing_mismatch")
+
+    companion_ephemeral = x25519.X25519PrivateKey.generate()
+    companion_ephemeral_public_key = base64url_encode(companion_ephemeral.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw))
+    shared = x25519.X25519PrivateKey.from_private_bytes(base64url_decode(identity["private_key"])).exchange(
+        x25519.X25519PublicKey.from_public_bytes(base64url_decode(device_public_key))
+    )
+    context = secure_remote_dataplane_context(
+        route_id,
+        session_id,
+        pairing.get("home_id"),
+        pairing.get("device_id"),
+        pairing.get("device_public_key"),
+        identity.get("public_key"),
+        device_ephemeral_public_key,
+        companion_ephemeral_public_key
+    )
+    session = {
+        "session_id": session_id,
+        "route_id": route_id,
+        "home_id": home_id,
+        "device_id": device_id,
+        "companion_ephemeral_public_key": companion_ephemeral_public_key,
+        "client_key": hkdf_dataplane_key(shared, context, b"|client_to_companion"),
+        "companion_key": hkdf_dataplane_key(shared, context, b"|companion_to_client"),
+        "highest_client_sequence": 0,
+        "next_companion_sequence": 1,
+        "expires_at": time.time() + 60,
+        "expires_in_seconds": 60
+    }
+    with SECURE_REMOTE_DATAPLANE_LOCK:
+        SECURE_REMOTE_DATAPLANE_SESSIONS[(route_id, session_id)] = session
+    return session
+
+
+def secure_remote_dataplane_session(binding, session_id):
+    key = (binding.get("route_id"), str(session_id or ""))
+    with SECURE_REMOTE_DATAPLANE_LOCK:
+        session = SECURE_REMOTE_DATAPLANE_SESSIONS.get(key)
+        if not session or session.get("expires_at", 0) < time.time():
+            SECURE_REMOTE_DATAPLANE_SESSIONS.pop(key, None)
+            return None
+        return session
+
+
+def secure_remote_dataplane_context(route_id, session_id, home_id, device_id, device_public_key, companion_public_key, device_ephemeral_public_key, companion_ephemeral_public_key):
+    return "|".join([
+        "protocol_version=1",
+        f"route_id={route_id}",
+        f"home_id={home_id}",
+        f"device_id={device_id}",
+        f"session_id={session_id}",
+        f"device_public_key={device_public_key}",
+        f"companion_public_key={companion_public_key}",
+        f"device_ephemeral_public_key={device_ephemeral_public_key}",
+        f"companion_ephemeral_public_key={companion_ephemeral_public_key}"
+    ]).encode("utf-8")
+
+
+def hkdf_dataplane_key(shared_secret, context, direction_suffix):
+    return HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=b"sosync-secure-remote-dataplane-v1",
+        info=context + direction_suffix,
+    ).derive(shared_secret)
+
+
+def secure_remote_dataplane_aad(route_id, session_id, device_id, direction, sequence, message_id):
+    return f"v=1|route={route_id}|session={session_id}|device={device_id}|direction={direction}|sequence={sequence}|message={message_id}".encode("utf-8")
+
+
+def decrypt_secure_remote_dataplane_envelope(binding, envelope, expected_direction):
+    session = secure_remote_dataplane_session(binding, envelope.get("session_id"))
+    if not session:
+        raise ValueError("encrypted_session_required")
+    if (
+        envelope.get("protocol_version") != 1
+        or envelope.get("route_id") != binding.get("route_id")
+        or envelope.get("device_id") != session.get("device_id")
+        or envelope.get("direction") != expected_direction
+    ):
+        raise ValueError("invalid_envelope_binding")
+    sequence = int(envelope.get("sequence") or 0)
+    if sequence <= int(session.get("highest_client_sequence") or 0):
+        raise ValueError("replay_rejected")
+    nonce = base64url_decode(envelope.get("nonce") or "")
+    ciphertext = base64url_decode(envelope.get("ciphertext") or "")
+    aad = secure_remote_dataplane_aad(binding.get("route_id"), session["session_id"], session["device_id"], expected_direction, sequence, str(envelope.get("message_id") or ""))
+    plaintext = ChaCha20Poly1305(session["client_key"]).decrypt(nonce, ciphertext, aad)
+    with SECURE_REMOTE_DATAPLANE_LOCK:
+        session["highest_client_sequence"] = sequence
+        SECURE_REMOTE_DATAPLANE_SESSIONS[(binding.get("route_id"), session["session_id"])] = session
+    return plaintext
+
+
+def encrypt_secure_remote_dataplane_envelope(binding, session_id, plaintext, direction, message_id):
+    session = secure_remote_dataplane_session(binding, session_id)
+    if not session:
+        raise ValueError("encrypted_session_required")
+    sequence = int(session.get("next_companion_sequence") or 1)
+    session["next_companion_sequence"] = sequence + 1
+    nonce = os.urandom(12)
+    aad = secure_remote_dataplane_aad(binding.get("route_id"), session["session_id"], session["device_id"], direction, sequence, message_id)
+    ciphertext = ChaCha20Poly1305(session["companion_key"]).encrypt(nonce, plaintext, aad)
+    with SECURE_REMOTE_DATAPLANE_LOCK:
+        SECURE_REMOTE_DATAPLANE_SESSIONS[(binding.get("route_id"), session["session_id"])] = session
+    return {
+        "protocol_version": 1,
+        "route_id": binding.get("route_id"),
+        "session_id": session["session_id"],
+        "device_id": session["device_id"],
+        "direction": direction,
+        "sequence": sequence,
+        "message_id": message_id,
+        "nonce": base64url_encode(nonce),
+        "ciphertext": base64url_encode(ciphertext)
+    }
+
+
+def perform_secure_remote_dataplane_rest(method, ha_path, headers, body_base64url):
+    target_url = f"{read_ha_upstream()}{ha_path}"
+    request_body = base64url_decode(body_base64url) if body_base64url else None
+    forwarded_headers = {}
+    for header in ("Authorization", "Content-Type", "Accept", "User-Agent"):
+        value = headers.get(header) if isinstance(headers, dict) else None
+        if value:
+            forwarded_headers[header] = value
+    request = urllib.request.Request(target_url, data=request_body, headers=forwarded_headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            body = response.read()
+            return {
+                "status": response.status,
+                "headers": {"Content-Type": response.headers.get("Content-Type", "application/json")},
+                "body_base64url": base64url_encode(body) if body else None
+            }
+    except urllib.error.HTTPError as error:
+        body = error.read()
+        return {
+            "status": error.code,
+            "headers": {"Content-Type": error.headers.get("Content-Type", "application/json")},
+            "body_base64url": base64url_encode(body) if body else None
+        }
+
+
+def bridge_secure_remote_dataplane_websocket(client_socket, upstream_socket, binding, session_id):
+    sockets = [client_socket, upstream_socket]
+    while True:
+        current_binding = read_secure_remote_binding()
+        if current_binding.get("status") == "revoked" or not secure_remote_dataplane_session(binding, session_id):
+            print(
+                f"[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionEncryptedWebSocketRevocationClosed route={safe_fingerprint(binding.get('route_id'))} maxRevocationEnforcementSeconds=60",
+                flush=True
+            )
+            return
+        readable, _, _ = select.select(sockets, [], [], 0.5)
+        for source in readable:
+            if source is client_socket:
+                opcode, payload = read_websocket_frame(client_socket)
+                if opcode in (0x8, None):
+                    return
+                envelope = json.loads(payload.decode("utf-8"))
+                plaintext = decrypt_secure_remote_dataplane_envelope(binding, envelope, "client_to_companion")
+                write_websocket_frame(upstream_socket, 0x1, plaintext, mask=False)
+            else:
+                opcode, payload = read_websocket_frame(upstream_socket)
+                if opcode in (0x8, None):
+                    return
+                envelope = encrypt_secure_remote_dataplane_envelope(binding, session_id, payload, "companion_to_client", f"ws-event-{uuid.uuid4()}")
+                write_websocket_frame(client_socket, 0x1, json.dumps(envelope, separators=(",", ":")).encode("utf-8"), mask=False)
+
+
+def read_websocket_frame(sock):
+    header = recv_exact(sock, 2)
+    if not header:
+        return None, b""
+    opcode = header[0] & 0x0F
+    masked = bool(header[1] & 0x80)
+    length = header[1] & 0x7F
+    if length == 126:
+        length = int.from_bytes(recv_exact(sock, 2), "big")
+    elif length == 127:
+        length = int.from_bytes(recv_exact(sock, 8), "big")
+    mask_key = recv_exact(sock, 4) if masked else b""
+    payload = recv_exact(sock, length) if length else b""
+    if masked:
+        payload = bytes(byte ^ mask_key[index % 4] for index, byte in enumerate(payload))
+    return opcode, payload
+
+
+def write_websocket_frame(sock, opcode, payload, mask=False):
+    first = 0x80 | (opcode & 0x0F)
+    length = len(payload)
+    if length < 126:
+        header = bytes([first, (0x80 if mask else 0) | length])
+    elif length < 65536:
+        header = bytes([first, (0x80 if mask else 0) | 126]) + length.to_bytes(2, "big")
+    else:
+        header = bytes([first, (0x80 if mask else 0) | 127]) + length.to_bytes(8, "big")
+    if mask:
+        mask_key = os.urandom(4)
+        payload = bytes(byte ^ mask_key[index % 4] for index, byte in enumerate(payload))
+        header += mask_key
+    sock.sendall(header + payload)
+
+
+def recv_exact(sock, length):
+    chunks = []
+    remaining = length
+    while remaining > 0:
+        chunk = sock.recv(remaining)
+        if not chunk:
+            raise ConnectionError("socket_closed")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
 
 
 def normalize_companion_target(value):
