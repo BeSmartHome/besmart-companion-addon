@@ -1453,7 +1453,22 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def create_secure_remote_dataplane_session(binding, request):
-    if request.get("protocol_version") != 1:
+    protocol_matches = request.get("protocol_version") == 1
+    if not protocol_matches:
+        print(
+            "[SOSYNC-E2EE-REMOTE-PAIRING] "
+            "stage=sessionPairingValidation "
+            "lookupFound=false "
+            "deviceIDMatches=false "
+            "clientKeyMatches=false "
+            "homeBindingMatches=false "
+            "companionKeyVersionMatches=false "
+            "protocolMatches=false "
+            "storedPairingFingerprint=none "
+            "requestPairingFingerprint=none "
+            "failureField=protocolVersion",
+            flush=True
+        )
         raise ValueError("unsupported_protocol_version")
     route_id = str(request.get("route_id") or "")
     session_id = str(request.get("session_id") or "")
@@ -1462,11 +1477,74 @@ def create_secure_remote_dataplane_session(binding, request):
     device_public_key = normalized_e2ee_public_key(request.get("device_public_key"))
     device_ephemeral_public_key = normalized_e2ee_public_key(request.get("device_ephemeral_public_key"))
     if route_id != binding.get("route_id") or not session_id or not device_id or not device_public_key or not device_ephemeral_public_key:
+        print(
+            "[SOSYNC-E2EE-REMOTE-PAIRING] "
+            "stage=sessionPairingValidation "
+            "lookupFound=false "
+            "deviceIDMatches=false "
+            "clientKeyMatches=false "
+            "homeBindingMatches=false "
+            "companionKeyVersionMatches=false "
+            "protocolMatches=true "
+            "storedPairingFingerprint=none "
+            f"requestPairingFingerprint={safe_fingerprint('|'.join([home_id, device_id, device_public_key or 'none']))} "
+            "failureField=sessionBinding",
+            flush=True
+        )
         raise ValueError("invalid_dataplane_session")
 
     pairings = read_e2ee_pairings().get("devices", {})
     pairing = pairings.get(device_id)
     identity = ensure_e2ee_identity()
+    lookup_found = bool(pairing)
+    status_active = lookup_found and pairing.get("status") == "active"
+    device_id_matches = lookup_found and pairing.get("device_id") == device_id
+    client_key_matches = lookup_found and pairing.get("device_public_key") == device_public_key
+    home_binding_matches = lookup_found and pairing.get("home_id") == home_id
+    companion_key_version_matches = lookup_found and int(pairing.get("key_version") or 0) == int(identity.get("key_version") or 0)
+    stored_pairing_fingerprint = "none"
+    if lookup_found:
+        stored_pairing_fingerprint = safe_fingerprint("|".join([
+            str(pairing.get("home_id") or ""),
+            str(pairing.get("device_id") or ""),
+            str(pairing.get("device_public_key") or ""),
+            str(pairing.get("companion_public_key") or ""),
+            str(pairing.get("key_version") or "")
+        ]))
+    request_pairing_fingerprint = safe_fingerprint("|".join([
+        home_id,
+        device_id,
+        device_public_key,
+        str(identity.get("public_key") or ""),
+        str(identity.get("key_version") or "")
+    ]))
+    failure_field = "none"
+    if not lookup_found:
+        failure_field = "lookup"
+    elif not status_active:
+        failure_field = "status"
+    elif not home_binding_matches:
+        failure_field = "homeBinding"
+    elif not client_key_matches:
+        failure_field = "clientPublicKey"
+    elif not device_id_matches:
+        failure_field = "deviceID"
+    elif not companion_key_version_matches:
+        failure_field = "companionKeyVersion"
+    print(
+        "[SOSYNC-E2EE-REMOTE-PAIRING] "
+        "stage=sessionPairingValidation "
+        f"lookupFound={str(lookup_found).lower()} "
+        f"deviceIDMatches={str(device_id_matches).lower()} "
+        f"clientKeyMatches={str(client_key_matches).lower()} "
+        f"homeBindingMatches={str(home_binding_matches).lower()} "
+        f"companionKeyVersionMatches={str(companion_key_version_matches).lower()} "
+        "protocolMatches=true "
+        f"storedPairingFingerprint={stored_pairing_fingerprint} "
+        f"requestPairingFingerprint={request_pairing_fingerprint} "
+        f"failureField={failure_field}",
+        flush=True
+    )
     if not pairing or pairing.get("status") != "active":
         raise ValueError("pairing_not_active")
     if pairing.get("home_id") != home_id or pairing.get("device_public_key") != device_public_key:
