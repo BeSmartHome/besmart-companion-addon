@@ -60,6 +60,7 @@ REMOTE_TOKEN_HEADER = "X-BeSmart-Remote-Token"
 HOME_PROFILE_PATH = "/besmart/home-profile"
 MAX_HOME_PROFILE_BYTES = 512 * 1024
 TAILSCALE_CONNECT_LOCK = threading.Lock()
+HOME_PROFILE_WRITE_LOCK = threading.Lock()
 PAIRING_TTL_SECONDS = 120
 E2EE_PROTOCOL_VERSION = 1
 SETUP_PACKAGE_INFO = b"besmart-sosync-remote-setup-package-v1"
@@ -70,6 +71,7 @@ RUNTIME_STARTED_AT = datetime.now(timezone.utc).isoformat()
 SOSYNC_COMPANION_VERSION = os.environ.get("SOSYNC_COMPANION_VERSION", "1.0.25")
 SOSYNC_COMPANION_BUILD = os.environ.get("SOSYNC_COMPANION_BUILD", "1.0.25-secure-remote-e2ee-ws-control-frame-v1")
 SECURE_REMOTE_TUNNEL_CONFIRMATION_SECONDS = float(os.environ.get("SOSYNC_TUNNEL_CONFIRMATION_SECONDS", "1.0"))
+SECURE_REMOTE_CONNECTOR_CONFIRMATION_SECONDS = float(os.environ.get("SOSYNC_CONNECTOR_CONFIRMATION_SECONDS", "0.8"))
 SECURE_REMOTE_TUNNEL_LOCK = threading.Lock()
 SECURE_REMOTE_TUNNEL_PROCESS = None
 SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY = None
@@ -544,10 +546,13 @@ class Handler(BaseHTTPRequestHandler):
                 flush=True
             )
             start_result = start_secure_remote_tunnel(binding)
-            binding["tunnel_configured"] = start_result["running"]
-            binding["tunnel_state"] = "running" if start_result["running"] else "failed"
-            binding["failure_stage"] = start_result.get("stage") if not start_result["running"] else None
-            binding["failure_reason"] = start_result.get("reason") if not start_result["running"] else None
+            connector_healthy = bool(start_result.get("connector_healthy"))
+            binding["tunnel_configured"] = connector_healthy
+            binding["tunnel_state"] = "active" if connector_healthy else ("connectorStarting" if start_result["running"] else "failed")
+            binding["failure_stage"] = start_result.get("stage") if not connector_healthy else None
+            binding["failure_reason"] = start_result.get("reason") if not connector_healthy else None
+            if connector_healthy:
+                binding["last_connected_at"] = binding.get("last_connected_at") or iso_now()
         else:
             binding["tunnel_configured"] = False
             binding["tunnel_state"] = "failed"
@@ -586,10 +591,13 @@ class Handler(BaseHTTPRequestHandler):
                 flush=True
             )
             start_result = start_secure_remote_tunnel(binding)
-            binding["tunnel_configured"] = start_result["running"]
-            binding["tunnel_state"] = "running" if start_result["running"] else "failed"
-            binding["failure_stage"] = start_result.get("stage") if not start_result["running"] else None
-            binding["failure_reason"] = start_result.get("reason") if not start_result["running"] else None
+            connector_healthy = bool(start_result.get("connector_healthy"))
+            binding["tunnel_configured"] = connector_healthy
+            binding["tunnel_state"] = "active" if connector_healthy else ("connectorStarting" if start_result["running"] else "failed")
+            binding["failure_stage"] = start_result.get("stage") if not connector_healthy else None
+            binding["failure_reason"] = start_result.get("reason") if not connector_healthy else None
+            if connector_healthy:
+                binding["last_connected_at"] = binding.get("last_connected_at") or iso_now()
         else:
             binding["tunnel_configured"] = False
             binding["tunnel_state"] = "failed"
@@ -758,20 +766,27 @@ class Handler(BaseHTTPRequestHandler):
             })
             return
         process_running = is_secure_remote_tunnel_running()
+        connector_status = secure_remote_connector_runtime_status(process_running)
         print(
-            f"[SOSYNC-SECURE-REMOTE-DATAPLANE] health method={self.command} path={request_path} route={safe_fingerprint(binding.get('route_id'))} tunnelBinding={safe_fingerprint(binding.get('tunnel_binding_id'))} tunnelState={binding.get('tunnel_state') or 'unconfigured'} cloudflaredRunning={process_running}",
+            f"[SOSYNC-SECURE-REMOTE-DATAPLANE] health method={self.command} path={request_path} route={safe_fingerprint(binding.get('route_id'))} tunnelBinding={safe_fingerprint(binding.get('tunnel_binding_id'))} tunnelState={binding.get('tunnel_state') or 'unconfigured'} cloudflaredRunning={process_running} connectorState={connector_status['connector_state']} connectorHealthy={connector_status['connector_healthy']} connectorConnectionCount={connector_status['connector_connection_count']} lastErrorClass={connector_status['last_error_class']}",
             flush=True
         )
-        if process_running:
+        if connector_status["connector_healthy"]:
             binding["tunnel_state"] = "active"
             binding["last_healthy_at"] = iso_now()
+            binding["last_connected_at"] = binding.get("last_connected_at") or iso_now()
             binding["updated_at"] = iso_now()
             write_json_file_secure(SECURE_REMOTE_BINDING_FILE, binding)
-        self._json(200 if process_running else 503, {
+        self._json(200 if connector_status["connector_healthy"] else 503, {
             "protocol_version": 1,
-            "status": "ok" if process_running else "unavailable",
+            "status": "ok" if connector_status["connector_healthy"] else "unavailable",
             "service": "besmart-companion-secure-remote",
-            "tunnel_state": binding.get("tunnel_state") or "unconfigured",
+            "tunnel_state": "active" if connector_status["connector_healthy"] else ("connectorStarting" if process_running else "unconfigured"),
+            "cloudflared_process_alive": process_running,
+            "connector_state": connector_status["connector_state"],
+            "connector_healthy": connector_status["connector_healthy"],
+            "connector_connection_count": connector_status["connector_connection_count"],
+            "last_error_class": connector_status["last_error_class"],
             "route_id_fingerprint": safe_fingerprint(binding.get("route_id")),
             "tunnel_binding_fingerprint": safe_fingerprint(binding.get("tunnel_binding_id"))
         }, headers={
@@ -2551,12 +2566,16 @@ def secure_remote_public_status(binding=None):
     has_route = bool(binding.get("route_id")) and binding.get("status") != "revoked"
     has_credential = bool(read_secure_text_file(secure_remote_tunnel_token_file()))
     cloudflared_running = is_secure_remote_tunnel_running()
+    connector_status = secure_remote_connector_runtime_status(cloudflared_running)
     if not has_route:
         tunnel_state = "notConfigured"
         tunnel_configured = False
-    elif cloudflared_running:
-        tunnel_state = "running"
+    elif connector_status["connector_healthy"]:
+        tunnel_state = "active"
         tunnel_configured = True
+    elif cloudflared_running:
+        tunnel_state = "connectorStarting"
+        tunnel_configured = False
     elif binding.get("tunnel_state") == "failed":
         tunnel_state = "failed"
         tunnel_configured = False
@@ -2585,6 +2604,13 @@ def secure_remote_public_status(binding=None):
         "failure_reason": binding.get("failure_reason"),
         "last_healthy_at": binding.get("last_healthy_at"),
         "cloudflared_running": cloudflared_running,
+        "cloudflared_process_alive": cloudflared_running,
+        "connector_state": connector_status["connector_state"],
+        "connector_healthy": connector_status["connector_healthy"],
+        "connector_connection_count": connector_status["connector_connection_count"],
+        "last_connected_at": binding.get("last_connected_at"),
+        "last_disconnected_at": binding.get("last_disconnected_at"),
+        "last_error_class": connector_status["last_error_class"],
         "cloudflare_connector_tunnel_id_hash": connector_identity["cloudflare_connector_tunnel_id_hash"],
         "connector_tunnel_identity_available": connector_identity["connector_tunnel_identity_available"],
         "connector_tunnel_identity_failure": connector_identity["connector_tunnel_identity_failure"],
@@ -2592,6 +2618,67 @@ def secure_remote_public_status(binding=None):
         "updated_at": binding.get("updated_at"),
         "revoked_at": binding.get("revoked_at")
     }
+
+
+def secure_remote_connector_runtime_status(cloudflared_running):
+    if not cloudflared_running:
+        return {
+            "connector_state": "notRunning",
+            "connector_healthy": False,
+            "connector_connection_count": 0,
+            "last_error_class": "processNotRunning"
+        }
+    excerpt = read_secure_remote_tunnel_stderr_excerpt(limit=4096)
+    lower = excerpt.lower()
+    connected_patterns = [
+        "registered tunnel connection",
+        "connection registered",
+        "registered connection",
+        "connected to"
+    ]
+    disconnected_patterns = [
+        "failed to serve tunnel connection",
+        "connection closed",
+        "disconnected",
+        "unable to establish",
+        "error"
+    ]
+    connection_count = sum(lower.count(pattern) for pattern in connected_patterns)
+    has_connected = connection_count > 0
+    has_disconnected = any(pattern in lower for pattern in disconnected_patterns)
+    if "1033" in lower:
+        error_class = "tunnelConnectorUnavailable"
+    elif "certificate" in lower or "cert" in lower:
+        error_class = "tlsOrCertificate"
+    elif "unauthorized" in lower or "permission" in lower:
+        error_class = "authorization"
+    elif has_disconnected and not has_connected:
+        error_class = "connectorDisconnected"
+    else:
+        error_class = "none"
+    return {
+        "connector_state": "connected" if has_connected else "starting",
+        "connector_healthy": has_connected,
+        "connector_connection_count": connection_count,
+        "last_error_class": error_class
+    }
+
+
+def wait_for_secure_remote_connector_health(deadline, process_locked=False):
+    while time.time() < deadline:
+        if process_locked:
+            process_running = SECURE_REMOTE_TUNNEL_PROCESS is not None and SECURE_REMOTE_TUNNEL_PROCESS.poll() is None
+        else:
+            process_running = is_secure_remote_tunnel_running()
+        status = secure_remote_connector_runtime_status(process_running)
+        if not process_running or status["connector_healthy"]:
+            return status
+        time.sleep(0.2)
+    if process_locked:
+        process_running = SECURE_REMOTE_TUNNEL_PROCESS is not None and SECURE_REMOTE_TUNNEL_PROCESS.poll() is None
+    else:
+        process_running = is_secure_remote_tunnel_running()
+    return secure_remote_connector_runtime_status(process_running)
 
 
 def secure_remote_current_process_connector_identity(cloudflared_running):
@@ -2717,15 +2804,16 @@ def start_secure_remote_tunnel(binding=None):
     with SECURE_REMOTE_TUNNEL_LOCK:
         if SECURE_REMOTE_TUNNEL_PROCESS is not None and SECURE_REMOTE_TUNNEL_PROCESS.poll() is None:
             process_identity = SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY or {"available": False, "failure": "identityNotCaptured", "cloudflare_connector_tunnel_id_hash": "none"}
+            connector_status = secure_remote_connector_runtime_status(True)
             print(
-                f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelProcessConfirmed route={safe_fingerprint(binding.get('route_id'))} running=true reused=true",
+                f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelProcessConfirmed route={safe_fingerprint(binding.get('route_id'))} running=true reused=true connectorState={connector_status['connector_state']} connectorHealthy={connector_status['connector_healthy']} connectorConnectionCount={connector_status['connector_connection_count']} lastErrorClass={connector_status['last_error_class']}",
                 flush=True
             )
             print(
                 f"[SOSYNC-SECURE-REMOTE-IDENTITY] cloudflareConnectorTunnelIDHash={process_identity.get('cloudflare_connector_tunnel_id_hash')} connectorTunnelIdentityAvailable={str(bool(process_identity.get('available'))).lower()} connectorTunnelIdentityFailure={process_identity.get('failure') or 'none'} connectorTokenFormat={process_identity.get('connector_token_format') or 'unknown'} tunnelManagementMode=remoteManaged effectiveIngressSource=cloudflareApi cloudflaredRunning=true",
                 flush=True
             )
-            return {"running": True, "stage": "confirmed", "reason": None}
+            return {"running": True, "connector_healthy": connector_status["connector_healthy"], "stage": "connectorHealthy" if connector_status["connector_healthy"] else "connectorStarting", "reason": None if connector_status["connector_healthy"] else connector_status["last_error_class"]}
         cloudflared_binary = os.environ.get("BESMART_CLOUDFLARED_BIN", "cloudflared")
         cloudflared_path = shutil.which(cloudflared_binary)
         if cloudflared_path is None:
@@ -2788,15 +2876,16 @@ def start_secure_remote_tunnel(binding=None):
                 return {"running": False, "stage": "immediateExit", "reason": "processExited"}
             if SECURE_REMOTE_TUNNEL_PROCESS.poll() is None:
                 SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY = token_identity
+                connector_status = wait_for_secure_remote_connector_health(time.time() + SECURE_REMOTE_CONNECTOR_CONFIRMATION_SECONDS, process_locked=True)
                 print(
-                    f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelProcessConfirmed route={safe_fingerprint(binding.get('route_id'))} running=true",
+                    f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelProcessConfirmed route={safe_fingerprint(binding.get('route_id'))} running=true connectorState={connector_status['connector_state']} connectorHealthy={connector_status['connector_healthy']} connectorConnectionCount={connector_status['connector_connection_count']} lastErrorClass={connector_status['last_error_class']}",
                     flush=True
                 )
                 print(
                     f"[SOSYNC-SECURE-REMOTE-IDENTITY] cloudflareConnectorTunnelIDHash={token_identity.get('cloudflare_connector_tunnel_id_hash')} connectorTunnelIdentityAvailable={str(bool(token_identity.get('available'))).lower()} connectorTunnelIdentityFailure={token_identity.get('failure') or 'none'} connectorTokenFormat={token_identity.get('connector_token_format') or 'unknown'} connectorTokenSegmentCount={token_identity.get('connector_token_segment_count')} connectorTokenDecodedObject={str(bool(token_identity.get('connector_token_decoded_object'))).lower()} connectorTokenDecodedKeys={','.join(token_identity.get('connector_token_decoded_keys') or [])} tunnelManagementMode=remoteManaged effectiveIngressSource=cloudflareApi cloudflaredRunning=true",
                     flush=True
                 )
-                return {"running": True, "stage": "confirmed", "reason": None}
+                return {"running": True, "connector_healthy": connector_status["connector_healthy"], "stage": "connectorHealthy" if connector_status["connector_healthy"] else "connectorStarting", "reason": None if connector_status["connector_healthy"] else connector_status["last_error_class"]}
             print(
                 f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelProcessFailed route={safe_fingerprint(binding.get('route_id'))} stage=confirmationTimeout reason=notRunning",
                 flush=True
@@ -2991,10 +3080,16 @@ def read_ha_upstream():
 
 def store_home_profile(profile):
     os.makedirs(os.path.dirname(HOME_PROFILE_FILE), exist_ok=True)
-    temporary_file = f"{HOME_PROFILE_FILE}.tmp"
-    with open(temporary_file, "w", encoding="utf-8") as file:
-        json.dump(profile, file, separators=(",", ":"))
-    os.replace(temporary_file, HOME_PROFILE_FILE)
+    temporary_file = f"{HOME_PROFILE_FILE}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
+    with HOME_PROFILE_WRITE_LOCK:
+        existing = read_home_profile()
+        if existing == profile:
+            return
+        with open(temporary_file, "w", encoding="utf-8") as file:
+            json.dump(profile, file, separators=(",", ":"))
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary_file, HOME_PROFILE_FILE)
 
 
 def read_home_profile():
@@ -3082,10 +3177,13 @@ def main():
     binding = read_secure_remote_binding()
     if binding.get("route_id") and read_secure_text_file(secure_remote_tunnel_token_file()):
         start_result = start_secure_remote_tunnel(binding)
-        binding["tunnel_configured"] = start_result["running"]
-        binding["tunnel_state"] = "running" if start_result["running"] else "failed"
-        binding["failure_stage"] = start_result.get("stage") if not start_result["running"] else None
-        binding["failure_reason"] = start_result.get("reason") if not start_result["running"] else None
+        connector_healthy = bool(start_result.get("connector_healthy"))
+        binding["tunnel_configured"] = connector_healthy
+        binding["tunnel_state"] = "active" if connector_healthy else ("connectorStarting" if start_result["running"] else "failed")
+        binding["failure_stage"] = start_result.get("stage") if not connector_healthy else None
+        binding["failure_reason"] = start_result.get("reason") if not connector_healthy else None
+        if connector_healthy:
+            binding["last_connected_at"] = binding.get("last_connected_at") or iso_now()
         binding["updated_at"] = iso_now()
         write_json_file_secure(SECURE_REMOTE_BINDING_FILE, binding)
     elif binding.get("tunnel_configured"):

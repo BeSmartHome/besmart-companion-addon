@@ -371,7 +371,7 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertTrue(provision["configured"])
         self.assertTrue(install["tunnel_configured"])
         self.assertTrue(status["tunnel_configured"])
-        self.assertEqual(install["tunnel_state"], "running")
+        self.assertEqual(install["tunnel_state"], "active")
         self.assertTrue(install["cloudflared_running"])
         self.assertEqual(status["credential_version"], 1)
         serialized = json.dumps(status)
@@ -1121,6 +1121,44 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertEqual(status["connector_tunnel_identity_failure"], "processNotRunning")
         self.assertEqual(status["connector_tunnel_token_format"], "unknown")
 
+    def test_secure_remote_process_alive_without_connector_registration_is_not_ready(self):
+        route_id = "r_abcdefghijklmnopqrstuvwxyz123456"
+        tunnel_id = "tun_abcdefghijklmnopqrstuvwxyz123456"
+        self._patch_cloudflared_start(running=True, stderr_message="INF cloudflared started but waiting for edge")
+        try:
+            with self._server() as base_url:
+                self._request_json("POST", base_url, "/secure-remote/provision", {
+                    "protocol_version": 1,
+                    "route_id": route_id,
+                    "tunnel_binding_id": tunnel_id,
+                    "home_reference": "home_ref",
+                    "device_reference": "device_ref",
+                    "device_public_key_fingerprint": "device_fp",
+                    "companion_public_key_fingerprint": "companion_key_fp",
+                    "companion_identity_fingerprint": "companion_identity_fp",
+                    "credential_version": 1
+                })
+                install_status, install = self._request_json("POST", base_url, "/secure-remote/tunnel/install", {
+                    "protocol_version": 1,
+                    "route_id": route_id,
+                    "credential_version": 1,
+                    "tunnel_credential": "secret-tunnel-credential"
+                })
+                health_status, health, _ = self._request_json_response("GET", base_url, "/secure-remote/data-plane/health/")
+        finally:
+            self._restore_cloudflared_start()
+
+        self.assertEqual(install_status, 503)
+        self.assertFalse(install["tunnel_configured"])
+        self.assertEqual(install["tunnel_state"], "connectorStarting")
+        self.assertTrue(install["cloudflared_process_alive"])
+        self.assertFalse(install["connector_healthy"])
+        self.assertEqual(install["connector_state"], "starting")
+        self.assertEqual(health_status, 503)
+        self.assertEqual(health["status"], "unavailable")
+        self.assertTrue(health["cloudflared_process_alive"])
+        self.assertFalse(health["connector_healthy"])
+
     def test_secure_remote_tunnel_install_uses_worker_connector_token_mode(self):
         route_id = "r_abcdefghijklmnopqrstuvwxyz123456"
         tunnel_id = "tun_abcdefghijklmnopqrstuvwxyz123456"
@@ -1149,7 +1187,7 @@ class CompanionP03Tests(unittest.TestCase):
             self._restore_cloudflared_start()
 
         self.assertEqual(install_status, 200)
-        self.assertEqual(install["tunnel_state"], "running")
+        self.assertEqual(install["tunnel_state"], "active")
         self.assertEqual(captured["args"][0][-2:], ["--token", "secret-tunnel-credential"])
 
     def test_secure_remote_rejects_semantic_route_and_stale_rotation(self):
@@ -1186,6 +1224,32 @@ class CompanionP03Tests(unittest.TestCase):
 
         self.assertEqual(bad_status, 400)
         self.assertEqual(stale_status, 409)
+
+    def test_home_profile_store_handles_concurrent_writes_without_tmp_race(self):
+        errors = []
+
+        def write_profile(index):
+            try:
+                app.store_home_profile({
+                    "server_id": f"srv_{index}",
+                    "home_id": "home_ref",
+                    "sequence": index
+                })
+            except Exception as error:
+                errors.append(error)
+
+        threads = [threading.Thread(target=write_profile, args=(index,)) for index in range(24)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(errors, [])
+        stored = app.read_home_profile()
+        self.assertIsInstance(stored, dict)
+        self.assertEqual(stored["home_id"], "home_ref")
+        self.assertIn("sequence", stored)
+        self.assertFalse(Path(f"{app.HOME_PROFILE_FILE}.tmp").exists())
 
     def _patch_paths(self, data_dir):
         app.DATA_DIR = data_dir
@@ -1238,8 +1302,11 @@ class CompanionP03Tests(unittest.TestCase):
             if captured is not None:
                 captured["args"] = args
             stderr = kwargs.get("stderr")
-            if stderr_message and stderr is not None:
-                stderr.write(stderr_message.encode("utf-8"))
+            message = stderr_message
+            if running and not message:
+                message = "INF Registered tunnel connection connIndex=0"
+            if message and stderr is not None:
+                stderr.write(message.encode("utf-8"))
                 stderr.flush()
             return FakeProcess()
 
