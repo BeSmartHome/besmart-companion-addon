@@ -55,6 +55,9 @@ jobs:
           file: ./besmart_companion/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
+          build-args: |
+            SOSYNC_COMPANION_VERSION=${{ steps.version.outputs.version }}
+            SOSYNC_COMPANION_BUILD=${{ steps.version.outputs.version }}-secure-remote-e2ee-ws-control-frame-v1
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
