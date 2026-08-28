@@ -14,6 +14,10 @@ startup: services
 boot: auto
 
 host_network: true
+ingress: true
+ingress_port: 8765
+ingress_entry: /
+ingress_stream: true
 
 options:
   backend_signing_public_key: ""
