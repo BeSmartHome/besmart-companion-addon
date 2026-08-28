@@ -154,13 +154,13 @@ class CompanionP03Tests(unittest.TestCase):
         dockerfile = (addon_root / "Dockerfile").read_text(encoding="utf-8")
         runtime = (addon_root / "app.py").read_text(encoding="utf-8")
 
-        self.assertIn('version: "1.0.25"', config)
+        self.assertIn('version: "1.0.30"', config)
         self.assertIn("e2ee_pairing_authorization", config)
         self.assertIn("COPY app.py /app/app.py", dockerfile)
         self.assertIn("CLOUDFLARED_VERSION=2026.8.2", dockerfile)
         self.assertIn("BESMART_CLOUDFLARED_BIN=/usr/local/bin/cloudflared", dockerfile)
-        self.assertIn("SOSYNC_COMPANION_VERSION=1.0.25", dockerfile)
-        self.assertIn("SOSYNC_COMPANION_BUILD=1.0.25-secure-remote-e2ee-ws-control-frame-v1", dockerfile)
+        self.assertIn("ARG SOSYNC_COMPANION_VERSION", dockerfile)
+        self.assertIn("ARG SOSYNC_COMPANION_BUILD", dockerfile)
         self.assertIn("/usr/local/bin/cloudflared --version", dockerfile)
         self.assertIn('self.path == "/security/e2ee/identity"', runtime)
         self.assertIn('self.path == "/security/e2ee/pair"', runtime)
@@ -168,7 +168,7 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertIn("tunnelCredentialInstalled", runtime)
         self.assertIn("tunnelProcessStarted", runtime)
         self.assertIn("tunnelProcessFailed", runtime)
-        self.assertIn("1.0.25-secure-remote-e2ee-ws-control-frame-v1", runtime)
+        self.assertIn("SOSYNC_COMPANION_BUILD", runtime)
 
     def test_health_and_identity_expose_runtime_build_marker(self):
         with self._server() as base_url:
@@ -177,9 +177,9 @@ class CompanionP03Tests(unittest.TestCase):
 
         self.assertEqual(health_status, 200)
         self.assertEqual(identity_status, 200)
-        self.assertEqual(health["build"], "1.0.25-secure-remote-e2ee-ws-control-frame-v1")
-        self.assertEqual(identity["build"], "1.0.25-secure-remote-e2ee-ws-control-frame-v1")
-        self.assertEqual(health["companion_version"], "1.0.25")
+        self.assertEqual(health["build"], app.SOSYNC_COMPANION_BUILD)
+        self.assertEqual(identity["build"], app.SOSYNC_COMPANION_BUILD)
+        self.assertEqual(health["companion_version"], app.SOSYNC_COMPANION_VERSION)
         self.assertIn("cloudflared_available", health)
         self.assertIn("cloudflared_running", health)
 
@@ -342,17 +342,12 @@ class CompanionP03Tests(unittest.TestCase):
         try:
             with self._server() as base_url:
                 identity_status, identity = self._request_json("GET", base_url, "/secure-remote/identity")
-                provision_status, provision = self._request_json("POST", base_url, "/secure-remote/provision", {
-                    "protocol_version": 1,
-                    "route_id": route_id,
-                    "tunnel_binding_id": tunnel_id,
-                    "home_reference": "home_ref",
-                    "device_reference": "device_ref",
-                    "device_public_key_fingerprint": "device_fp",
-                    "companion_public_key_fingerprint": "companion_key_fp",
-                    "companion_identity_fingerprint": "companion_identity_fp",
-                    "credential_version": 1
-                })
+                provision_status, provision = self._request_json(
+                    "POST",
+                    base_url,
+                    "/secure-remote/provision",
+                    self._valid_secure_remote_binding_request(route_id=route_id, tunnel_binding_id=tunnel_id)
+                )
                 install_status, install = self._request_json("POST", base_url, "/secure-remote/tunnel/install", {
                     "protocol_version": 1,
                     "route_id": route_id,
@@ -384,18 +379,16 @@ class CompanionP03Tests(unittest.TestCase):
         self._patch_cloudflared_start(running=True)
         try:
             with self._server() as base_url:
-                provision_status, _ = self._request_json("POST", base_url, "/secure-remote/provision", {
-                    "protocol_version": 1,
-                    "route_id": route_id,
-                    "tunnel_binding_id": tunnel_id,
-                    "home_reference": "home_ref",
-                    "device_reference": "device_ref",
-                    "device_public_key_fingerprint": "device_fp",
-                    "companion_public_key_fingerprint": "companion_key_fp",
-                    "companion_identity_fingerprint": "companion_identity_fp",
-                    "credential_version": 1,
-                    "origin_access_token": "orig_abcdefghijklmnopqrstuvwxyz123456"
-                })
+                provision_status, _ = self._request_json(
+                    "POST",
+                    base_url,
+                    "/secure-remote/provision",
+                    self._valid_secure_remote_binding_request(
+                        route_id=route_id,
+                        tunnel_binding_id=tunnel_id,
+                        origin_access_token="orig_abcdefghijklmnopqrstuvwxyz123456"
+                    )
+                )
                 install_status, _ = self._request_json("POST", base_url, "/secure-remote/tunnel/install", {
                     "protocol_version": 1,
                     "route_id": route_id,
@@ -428,18 +421,16 @@ class CompanionP03Tests(unittest.TestCase):
         self._patch_cloudflared_start(running=True)
         try:
             with self._server() as base_url:
-                self._request_json("POST", base_url, "/secure-remote/provision", {
-                    "protocol_version": 1,
-                    "route_id": route_id,
-                    "tunnel_binding_id": tunnel_id,
-                    "home_reference": "home_ref",
-                    "device_reference": "device_ref",
-                    "device_public_key_fingerprint": "device_fp",
-                    "companion_public_key_fingerprint": "companion_key_fp",
-                    "companion_identity_fingerprint": "companion_identity_fp",
-                    "credential_version": 1,
-                    "origin_access_token": "orig_abcdefghijklmnopqrstuvwxyz123456"
-                })
+                self._request_json(
+                    "POST",
+                    base_url,
+                    "/secure-remote/provision",
+                    self._valid_secure_remote_binding_request(
+                        route_id=route_id,
+                        tunnel_binding_id=tunnel_id,
+                        origin_access_token="orig_abcdefghijklmnopqrstuvwxyz123456"
+                    )
+                )
                 status, body, headers = self._request_json_response("GET", base_url, "/secure-remote/data-plane/e2ee/ws?session_id=missing", headers={
                     "Connection": "Upgrade",
                     "Upgrade": "websocket",
@@ -596,18 +587,16 @@ class CompanionP03Tests(unittest.TestCase):
         self._patch_cloudflared_start(running=True)
         try:
             with self._server() as base_url:
-                self._request_json("POST", base_url, "/secure-remote/provision", {
-                    "protocol_version": 1,
-                    "route_id": route_id,
-                    "tunnel_binding_id": tunnel_id,
-                    "home_reference": "home_ref",
-                    "device_reference": "device_ref",
-                    "device_public_key_fingerprint": "device_fp",
-                    "companion_public_key_fingerprint": "companion_key_fp",
-                    "companion_identity_fingerprint": "companion_identity_fp",
-                    "credential_version": 1,
-                    "origin_access_token": "orig_abcdefghijklmnopqrstuvwxyz123456"
-                })
+                self._request_json(
+                    "POST",
+                    base_url,
+                    "/secure-remote/provision",
+                    self._valid_secure_remote_binding_request(
+                        route_id=route_id,
+                        tunnel_binding_id=tunnel_id,
+                        origin_access_token="orig_abcdefghijklmnopqrstuvwxyz123456"
+                    )
+                )
                 self._request_json("POST", base_url, "/secure-remote/tunnel/install", {
                     "protocol_version": 1,
                     "route_id": route_id,
@@ -690,18 +679,16 @@ class CompanionP03Tests(unittest.TestCase):
         self._patch_cloudflared_start(running=True)
         try:
             with self._server() as base_url:
-                self._request_json("POST", base_url, "/secure-remote/provision", {
-                    "protocol_version": 1,
-                    "route_id": route_id,
-                    "tunnel_binding_id": tunnel_id,
-                    "home_reference": "home_ref",
-                    "device_reference": "device_ref",
-                    "device_public_key_fingerprint": "device_fp",
-                    "companion_public_key_fingerprint": "companion_key_fp",
-                    "companion_identity_fingerprint": "companion_identity_fp",
-                    "credential_version": 1,
-                    "origin_access_token": origin_token
-                })
+                self._request_json(
+                    "POST",
+                    base_url,
+                    "/secure-remote/provision",
+                    self._valid_secure_remote_binding_request(
+                        route_id=route_id,
+                        tunnel_binding_id=tunnel_id,
+                        origin_access_token=origin_token
+                    )
+                )
                 self._request_json("POST", base_url, "/secure-remote/tunnel/install", {
                     "protocol_version": 1,
                     "route_id": route_id,
@@ -863,17 +850,12 @@ class CompanionP03Tests(unittest.TestCase):
         self._patch_cloudflared_start(running=True)
         try:
             with self._server() as base_url:
-                self._request_json("POST", base_url, "/secure-remote/provision", {
-                    "protocol_version": 1,
-                    "route_id": route_id,
-                    "tunnel_binding_id": tunnel_id,
-                    "home_reference": "home_ref",
-                    "device_reference": "device_ref",
-                    "device_public_key_fingerprint": "device_fp",
-                    "companion_public_key_fingerprint": "companion_key_fp",
-                    "companion_identity_fingerprint": "companion_identity_fp",
-                    "credential_version": 1
-                })
+                self._request_json(
+                    "POST",
+                    base_url,
+                    "/secure-remote/provision",
+                    self._valid_secure_remote_binding_request(route_id=route_id, tunnel_binding_id=tunnel_id)
+                )
                 install_status, install = self._request_json("POST", base_url, "/secure-remote/tunnel/install", {
                     "protocol_version": 1,
                     "route_id": route_id,
@@ -929,17 +911,15 @@ class CompanionP03Tests(unittest.TestCase):
         app.write_json_file_secure(app.SECURE_REMOTE_BINDING_FILE, stale_binding)
 
         with self._server() as base_url:
-            provision_status, provision = self._request_json("POST", base_url, "/secure-remote/provision", {
-                "protocol_version": 1,
-                "route_id": "r_newabcdefghijklmnopqrstuvwxyz123456",
-                "tunnel_binding_id": "tun_newabcdefghijklmnopqrstuvwxyz123456",
-                "home_reference": "home_ref",
-                "device_reference": "device_ref",
-                "device_public_key_fingerprint": "device_fp",
-                "companion_public_key_fingerprint": "companion_key_fp",
-                "companion_identity_fingerprint": "companion_identity_fp",
-                "credential_version": 1
-            })
+            provision_status, provision = self._request_json(
+                "POST",
+                base_url,
+                "/secure-remote/provision",
+                self._valid_secure_remote_binding_request(
+                    route_id="r_newabcdefghijklmnopqrstuvwxyz123456",
+                    tunnel_binding_id="tun_newabcdefghijklmnopqrstuvwxyz123456"
+                )
+            )
 
         self.assertEqual(provision_status, 200)
         self.assertTrue(provision["configured"])
@@ -949,23 +929,161 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertEqual(provision["tunnel_state"], "notConfigured")
         self.assertEqual(app.read_secure_text_file(app.secure_remote_tunnel_token_file()), "")
 
+    def test_companion_pairing_home_migration_updates_legacy_home_when_trusted_local(self):
+        Path(app.SERVER_ID_FILE).write_text("srv_current", encoding="utf-8")
+        identity = app.ensure_e2ee_identity()
+        device_id = "22222222-2222-4222-8222-222222222222"
+        device_public_key = self._sample_device_public_key()
+        record = app.make_e2ee_pairing_record(
+            home_id="home_legacy",
+            device_id=device_id,
+            device_public_key=device_public_key,
+            companion_public_key=identity["public_key"],
+            key_version=identity["key_version"]
+        )
+        record["created_at"] = "2026-08-28T00:00:00+00:00"
+        app.write_json_file_secure(app.E2EE_PAIRINGS_FILE, {"devices": {device_id: record}})
+
+        result = app.migrate_e2ee_pairing_home_for_secure_remote_binding_if_needed(
+            self._secure_remote_binding_request("home_canonical", device_id, device_public_key)
+        )
+        stored = app.read_e2ee_pairings()["devices"][device_id]
+
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["result"], "migrated")
+        self.assertEqual(stored["home_id"], "home_canonical")
+        self.assertEqual(stored["device_id"], record["device_id"])
+        self.assertEqual(stored["device_public_key"], record["device_public_key"])
+        self.assertEqual(stored["companion_public_key"], record["companion_public_key"])
+        self.assertEqual(stored["created_at"], record["created_at"])
+        self.assertEqual(stored["key_version"], record["key_version"])
+        self.assertEqual(stored["status"], record["status"])
+
+    def test_companion_pairing_home_migration_is_noop_when_already_canonical(self):
+        Path(app.SERVER_ID_FILE).write_text("srv_current", encoding="utf-8")
+        identity = app.ensure_e2ee_identity()
+        device_id = "22222222-2222-4222-8222-222222222222"
+        device_public_key = self._sample_device_public_key()
+        record = app.make_e2ee_pairing_record(
+            home_id="home_canonical",
+            device_id=device_id,
+            device_public_key=device_public_key,
+            companion_public_key=identity["public_key"],
+            key_version=identity["key_version"]
+        )
+        app.write_json_file_secure(app.E2EE_PAIRINGS_FILE, {"devices": {device_id: record}})
+
+        result = app.migrate_e2ee_pairing_home_for_secure_remote_binding_if_needed(
+            self._secure_remote_binding_request("home_canonical", device_id, device_public_key)
+        )
+
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["result"], "noop")
+        self.assertEqual(app.read_e2ee_pairings()["devices"][device_id], record)
+
+    def test_companion_pairing_home_migration_rejects_device_mismatch(self):
+        Path(app.SERVER_ID_FILE).write_text("srv_current", encoding="utf-8")
+        identity = app.ensure_e2ee_identity()
+        device_id = "22222222-2222-4222-8222-222222222222"
+        device_public_key = self._sample_device_public_key()
+        record = app.make_e2ee_pairing_record(
+            home_id="home_legacy",
+            device_id="33333333-3333-4333-8333-333333333333",
+            device_public_key=device_public_key,
+            companion_public_key=identity["public_key"],
+            key_version=identity["key_version"]
+        )
+        app.write_json_file_secure(app.E2EE_PAIRINGS_FILE, {"devices": {device_id: record}})
+
+        result = app.migrate_e2ee_pairing_home_for_secure_remote_binding_if_needed(
+            self._secure_remote_binding_request("home_canonical", device_id, device_public_key)
+        )
+
+        self.assertFalse(result["accepted"])
+        self.assertEqual(app.read_e2ee_pairings()["devices"][device_id]["home_id"], "home_legacy")
+
+    def test_companion_pairing_home_migration_rejects_public_key_mismatch(self):
+        Path(app.SERVER_ID_FILE).write_text("srv_current", encoding="utf-8")
+        identity = app.ensure_e2ee_identity()
+        device_id = "22222222-2222-4222-8222-222222222222"
+        device_public_key = self._sample_device_public_key()
+        record = app.make_e2ee_pairing_record(
+            home_id="home_legacy",
+            device_id=device_id,
+            device_public_key=device_public_key,
+            companion_public_key=identity["public_key"],
+            key_version=identity["key_version"]
+        )
+        app.write_json_file_secure(app.E2EE_PAIRINGS_FILE, {"devices": {device_id: record}})
+
+        result = app.migrate_e2ee_pairing_home_for_secure_remote_binding_if_needed(
+            self._secure_remote_binding_request("home_canonical", device_id, self._alternate_device_public_key())
+        )
+
+        self.assertFalse(result["accepted"])
+        self.assertEqual(app.read_e2ee_pairings()["devices"][device_id]["home_id"], "home_legacy")
+
+    def test_companion_pairing_home_migration_rejects_inactive_pairing(self):
+        Path(app.SERVER_ID_FILE).write_text("srv_current", encoding="utf-8")
+        identity = app.ensure_e2ee_identity()
+        device_id = "22222222-2222-4222-8222-222222222222"
+        device_public_key = self._sample_device_public_key()
+        record = app.make_e2ee_pairing_record(
+            home_id="home_legacy",
+            device_id=device_id,
+            device_public_key=device_public_key,
+            companion_public_key=identity["public_key"],
+            key_version=identity["key_version"]
+        )
+        record["status"] = "revoked"
+        app.write_json_file_secure(app.E2EE_PAIRINGS_FILE, {"devices": {device_id: record}})
+
+        result = app.migrate_e2ee_pairing_home_for_secure_remote_binding_if_needed(
+            self._secure_remote_binding_request("home_canonical", device_id, device_public_key)
+        )
+
+        self.assertFalse(result["accepted"])
+        self.assertEqual(app.read_e2ee_pairings()["devices"][device_id]["home_id"], "home_legacy")
+
+    def test_remote_e2ee_session_cannot_trigger_companion_pairing_home_migration(self):
+        identity = app.ensure_e2ee_identity()
+        device_id = "22222222-2222-4222-8222-222222222222"
+        device_public_key = self._sample_device_public_key()
+        record = app.make_e2ee_pairing_record(
+            home_id="home_legacy",
+            device_id=device_id,
+            device_public_key=device_public_key,
+            companion_public_key=identity["public_key"],
+            key_version=identity["key_version"]
+        )
+        app.write_json_file_secure(app.E2EE_PAIRINGS_FILE, {"devices": {device_id: record}})
+        binding = app.make_secure_remote_binding(self._secure_remote_binding_request("home_canonical", device_id, device_public_key))
+
+        with self.assertRaises(ValueError):
+            app.create_secure_remote_dataplane_session(binding, {
+                "protocol_version": 1,
+                "route_id": binding["route_id"],
+                "session_id": "session-1",
+                "home_id": "home_canonical",
+                "device_id": device_id,
+                "device_public_key": device_public_key,
+                "device_ephemeral_public_key": self._alternate_device_public_key()
+            })
+
+        self.assertEqual(app.read_e2ee_pairings()["devices"][device_id]["home_id"], "home_legacy")
+
     def test_secure_remote_tunnel_install_fails_closed_when_cloudflared_missing(self):
         route_id = "r_abcdefghijklmnopqrstuvwxyz123456"
         tunnel_id = "tun_abcdefghijklmnopqrstuvwxyz123456"
         self._patch_cloudflared_start(missing=True)
         try:
             with self._server() as base_url:
-                provision_status, _ = self._request_json("POST", base_url, "/secure-remote/provision", {
-                    "protocol_version": 1,
-                    "route_id": route_id,
-                    "tunnel_binding_id": tunnel_id,
-                    "home_reference": "home_ref",
-                    "device_reference": "device_ref",
-                    "device_public_key_fingerprint": "device_fp",
-                    "companion_public_key_fingerprint": "companion_key_fp",
-                    "companion_identity_fingerprint": "companion_identity_fp",
-                    "credential_version": 1
-                })
+                provision_status, _ = self._request_json(
+                    "POST",
+                    base_url,
+                    "/secure-remote/provision",
+                    self._valid_secure_remote_binding_request(route_id=route_id, tunnel_binding_id=tunnel_id)
+                )
                 install_status, install = self._request_json("POST", base_url, "/secure-remote/tunnel/install", {
                     "protocol_version": 1,
                     "route_id": route_id,
@@ -1007,17 +1125,12 @@ class CompanionP03Tests(unittest.TestCase):
         )
         try:
             with self._server() as base_url:
-                provision_status, _ = self._request_json("POST", base_url, "/secure-remote/provision", {
-                    "protocol_version": 1,
-                    "route_id": route_id,
-                    "tunnel_binding_id": tunnel_id,
-                    "home_reference": "home_ref",
-                    "device_reference": "device_ref",
-                    "device_public_key_fingerprint": "device_fp",
-                    "companion_public_key_fingerprint": "companion_key_fp",
-                    "companion_identity_fingerprint": "companion_identity_fp",
-                    "credential_version": 1
-                })
+                provision_status, _ = self._request_json(
+                    "POST",
+                    base_url,
+                    "/secure-remote/provision",
+                    self._valid_secure_remote_binding_request(route_id=route_id, tunnel_binding_id=tunnel_id)
+                )
                 install_status, install = self._request_json("POST", base_url, "/secure-remote/tunnel/install", {
                     "protocol_version": 1,
                     "route_id": route_id,
@@ -1037,17 +1150,12 @@ class CompanionP03Tests(unittest.TestCase):
         route_id = "r_abcdefghijklmnopqrstuvwxyz123456"
         tunnel_id = "tun_abcdefghijklmnopqrstuvwxyz123456"
         with self._server() as base_url:
-            provision_status, _ = self._request_json("POST", base_url, "/secure-remote/provision", {
-                "protocol_version": 1,
-                "route_id": route_id,
-                "tunnel_binding_id": tunnel_id,
-                "home_reference": "home_ref",
-                "device_reference": "device_ref",
-                "device_public_key_fingerprint": "device_fp",
-                "companion_public_key_fingerprint": "companion_key_fp",
-                "companion_identity_fingerprint": "companion_identity_fp",
-                "credential_version": 1
-            })
+            provision_status, _ = self._request_json(
+                "POST",
+                base_url,
+                "/secure-remote/provision",
+                self._valid_secure_remote_binding_request(route_id=route_id, tunnel_binding_id=tunnel_id)
+            )
             install_status, install = self._request_json("POST", base_url, "/secure-remote/tunnel/install", {
                 "protocol_version": 1,
                 "route_id": route_id,
@@ -1068,17 +1176,12 @@ class CompanionP03Tests(unittest.TestCase):
         self._patch_cloudflared_start(raise_start=True)
         try:
             with self._server() as base_url:
-                provision_status, _ = self._request_json("POST", base_url, "/secure-remote/provision", {
-                    "protocol_version": 1,
-                    "route_id": route_id,
-                    "tunnel_binding_id": tunnel_id,
-                    "home_reference": "home_ref",
-                    "device_reference": "device_ref",
-                    "device_public_key_fingerprint": "device_fp",
-                    "companion_public_key_fingerprint": "companion_key_fp",
-                    "companion_identity_fingerprint": "companion_identity_fp",
-                    "credential_version": 1
-                })
+                provision_status, _ = self._request_json(
+                    "POST",
+                    base_url,
+                    "/secure-remote/provision",
+                    self._valid_secure_remote_binding_request(route_id=route_id, tunnel_binding_id=tunnel_id)
+                )
                 install_status, install = self._request_json("POST", base_url, "/secure-remote/tunnel/install", {
                     "protocol_version": 1,
                     "route_id": route_id,
@@ -1127,17 +1230,12 @@ class CompanionP03Tests(unittest.TestCase):
         self._patch_cloudflared_start(running=True, stderr_message="INF cloudflared started but waiting for edge")
         try:
             with self._server() as base_url:
-                self._request_json("POST", base_url, "/secure-remote/provision", {
-                    "protocol_version": 1,
-                    "route_id": route_id,
-                    "tunnel_binding_id": tunnel_id,
-                    "home_reference": "home_ref",
-                    "device_reference": "device_ref",
-                    "device_public_key_fingerprint": "device_fp",
-                    "companion_public_key_fingerprint": "companion_key_fp",
-                    "companion_identity_fingerprint": "companion_identity_fp",
-                    "credential_version": 1
-                })
+                self._request_json(
+                    "POST",
+                    base_url,
+                    "/secure-remote/provision",
+                    self._valid_secure_remote_binding_request(route_id=route_id, tunnel_binding_id=tunnel_id)
+                )
                 install_status, install = self._request_json("POST", base_url, "/secure-remote/tunnel/install", {
                     "protocol_version": 1,
                     "route_id": route_id,
@@ -1166,17 +1264,12 @@ class CompanionP03Tests(unittest.TestCase):
         self._patch_cloudflared_start(running=True, captured=captured)
         try:
             with self._server() as base_url:
-                self._request_json("POST", base_url, "/secure-remote/provision", {
-                    "protocol_version": 1,
-                    "route_id": route_id,
-                    "tunnel_binding_id": tunnel_id,
-                    "home_reference": "home_ref",
-                    "device_reference": "device_ref",
-                    "device_public_key_fingerprint": "device_fp",
-                    "companion_public_key_fingerprint": "companion_key_fp",
-                    "companion_identity_fingerprint": "companion_identity_fp",
-                    "credential_version": 1
-                })
+                self._request_json(
+                    "POST",
+                    base_url,
+                    "/secure-remote/provision",
+                    self._valid_secure_remote_binding_request(route_id=route_id, tunnel_binding_id=tunnel_id)
+                )
                 install_status, install = self._request_json("POST", base_url, "/secure-remote/tunnel/install", {
                     "protocol_version": 1,
                     "route_id": route_id,
@@ -1204,17 +1297,16 @@ class CompanionP03Tests(unittest.TestCase):
                 "companion_identity_fingerprint": "companion_identity_fp",
                 "credential_version": 1
             })
-            self._request_json("POST", base_url, "/secure-remote/provision", {
-                "protocol_version": 1,
-                "route_id": route_id,
-                "tunnel_binding_id": "tun_abcdefghijklmnopqrstuvwxyz123456",
-                "home_reference": "home_ref",
-                "device_reference": "device_ref",
-                "device_public_key_fingerprint": "device_fp",
-                "companion_public_key_fingerprint": "companion_key_fp",
-                "companion_identity_fingerprint": "companion_identity_fp",
-                "credential_version": 2
-            })
+            self._request_json(
+                "POST",
+                base_url,
+                "/secure-remote/provision",
+                self._valid_secure_remote_binding_request(
+                    route_id=route_id,
+                    tunnel_binding_id="tun_abcdefghijklmnopqrstuvwxyz123456",
+                    credential_version=2
+                )
+            )
             stale_status, _ = self._request_json("POST", base_url, "/secure-remote/tunnel/rotate", {
                 "protocol_version": 1,
                 "route_id": route_id,
@@ -1334,6 +1426,75 @@ class CompanionP03Tests(unittest.TestCase):
 
     def _write_options(self, value):
         Path(app.ADDON_OPTIONS_FILE).write_text(json.dumps(value), encoding="utf-8")
+
+    def _sample_device_public_key(self):
+        return app.base64url_encode(bytes([7]) * 32)
+
+    def _alternate_device_public_key(self):
+        return app.base64url_encode(bytes([11]) * 32)
+
+    def _seed_e2ee_pairing(self, home_id="home_ref", device_id="device_ref", device_public_key=None, status="active"):
+        identity = app.ensure_e2ee_identity()
+        device_public_key = device_public_key or self._sample_device_public_key()
+        record = app.make_e2ee_pairing_record(
+            home_id=home_id,
+            device_id=device_id,
+            device_public_key=device_public_key,
+            companion_public_key=identity["public_key"],
+            key_version=identity["key_version"]
+        )
+        record["status"] = status
+        app.write_json_file_secure(app.E2EE_PAIRINGS_FILE, {"devices": {device_id: record}})
+        return device_public_key
+
+    def _secure_remote_binding_request(
+        self,
+        home_reference,
+        device_reference,
+        device_public_key,
+        route_id="r_abcdefghijklmnopqrstuvwxyz123456",
+        tunnel_binding_id="tun_abcdefghijklmnopqrstuvwxyz123456",
+        credential_version=1,
+        origin_access_token=None
+    ):
+        identity = app.ensure_e2ee_identity()
+        companion_identity_fingerprint = app.sha256_base64url(
+            f"{app.E2EE_PROTOCOL_VERSION}|{identity['public_key']}|{identity['key_version']}".encode("utf-8")
+        )
+        request = {
+            "protocol_version": 1,
+            "route_id": route_id,
+            "tunnel_binding_id": tunnel_binding_id,
+            "home_reference": home_reference,
+            "device_reference": device_reference,
+            "device_public_key_fingerprint": app.sha256_base64url(device_public_key.encode("utf-8")),
+            "companion_public_key_fingerprint": app.sha256_base64url(identity["public_key"].encode("utf-8")),
+            "companion_identity_fingerprint": companion_identity_fingerprint,
+            "credential_version": credential_version
+        }
+        if origin_access_token is not None:
+            request["origin_access_token"] = origin_access_token
+        return request
+
+    def _valid_secure_remote_binding_request(
+        self,
+        home_reference="home_ref",
+        device_reference="device_ref",
+        route_id="r_abcdefghijklmnopqrstuvwxyz123456",
+        tunnel_binding_id="tun_abcdefghijklmnopqrstuvwxyz123456",
+        credential_version=1,
+        origin_access_token=None
+    ):
+        device_public_key = self._seed_e2ee_pairing(home_reference, device_reference)
+        return self._secure_remote_binding_request(
+            home_reference,
+            device_reference,
+            device_public_key,
+            route_id=route_id,
+            tunnel_binding_id=tunnel_binding_id,
+            credential_version=credential_version,
+            origin_access_token=origin_access_token
+        )
 
     def _make_setup_package(self, identity, backend_private_key, server_id, package_id="pkg-1", connect_id="connect-1"):
         suite = app.hpke_suite()

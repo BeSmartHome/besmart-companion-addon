@@ -502,6 +502,10 @@ class Handler(BaseHTTPRequestHandler):
         if not is_valid_secure_remote_binding_request(data):
             self._json(400, {"error": "invalid_secure_remote_binding"})
             return
+        migration_result = migrate_e2ee_pairing_home_for_secure_remote_binding_if_needed(data)
+        if not migration_result.get("accepted"):
+            self._json(403, {"error": "e2ee_pairing_migration_rejected"})
+            return
         stop_secure_remote_tunnel()
         remove_secure_file(secure_remote_tunnel_token_file())
         binding = make_secure_remote_binding(data)
@@ -2127,6 +2131,15 @@ def store_server_id(server_id):
         file.write(str(server_id).strip())
 
 
+def read_existing_server_id():
+    try:
+        with open(SERVER_ID_FILE, "r", encoding="utf-8") as file:
+            value = file.read().strip()
+            return value or None
+    except FileNotFoundError:
+        return None
+
+
 def get_or_create_server_id():
     try:
         with open(SERVER_ID_FILE, "r", encoding="utf-8") as file:
@@ -2637,6 +2650,86 @@ def make_secure_remote_binding(data):
         "updated_at": now,
         "revoked_at": None
     }
+
+
+def migrate_e2ee_pairing_home_for_secure_remote_binding_if_needed(data):
+    target_home_id = str(data.get("home_reference") or "").strip()
+    device_id = str(data.get("device_reference") or "").strip()
+    device_public_key_fingerprint = str(data.get("device_public_key_fingerprint") or "").strip()
+    companion_public_key_fingerprint = str(data.get("companion_public_key_fingerprint") or "").strip()
+    companion_identity_fingerprint = str(data.get("companion_identity_fingerprint") or "").strip()
+    pairings = read_e2ee_pairings()
+    devices = pairings.get("devices", {})
+    record = devices.get(device_id)
+    identity = ensure_e2ee_identity()
+    companion_identity = ensure_companion_identity()
+    local_server_identity_available = bool(read_existing_server_id())
+    lookup_found = isinstance(record, dict)
+    status_active = lookup_found and record.get("status") == "active"
+    device_id_matches = lookup_found and record.get("device_id") == device_id
+    device_public_key = str(record.get("device_public_key") or "") if lookup_found else ""
+    client_key_matches = lookup_found and sha256_base64url(device_public_key.encode("utf-8")) == device_public_key_fingerprint
+    companion_key_matches = lookup_found and sha256_base64url(str(record.get("companion_public_key") or "").encode("utf-8")) == companion_public_key_fingerprint
+    companion_identity_matches = companion_identity_fingerprint == sha256_base64url(
+        f"{E2EE_PROTOCOL_VERSION}|{identity.get('public_key')}|{identity.get('key_version')}".encode("utf-8")
+    )
+    home_binding_matches = lookup_found and record.get("home_id") == target_home_id
+    legacy_home_mismatch = lookup_found and status_active and device_id_matches and client_key_matches and companion_key_matches and companion_identity_matches and not home_binding_matches
+    decision = "noop" if home_binding_matches else ("migrate" if legacy_home_mismatch else "reject")
+    print(
+        "[SOSYNC-E2EE-MIGRATION] "
+        "stage=companionPairingHomeMigrationEligibility "
+        f"lookupFound={str(lookup_found).lower()} "
+        f"statusActive={str(status_active).lower()} "
+        f"deviceIDMatches={str(device_id_matches).lower()} "
+        f"clientKeyMatches={str(client_key_matches).lower()} "
+        f"companionPublicKeyMatches={str(companion_key_matches).lower()} "
+        f"companionIdentityMatches={str(companion_identity_matches).lower()} "
+        f"homeBindingMatches={str(home_binding_matches).lower()} "
+        f"trustedLocalServerIdentityAvailable={str(local_server_identity_available).lower()} "
+        f"decision={decision}",
+        flush=True
+    )
+    if not lookup_found:
+        print("[SOSYNC-E2EE-MIGRATION] stage=companionPairingHomeMigrationSkipped reason=missingPairing", flush=True)
+        return {"accepted": False, "result": "rejected", "reason": "missingPairing"}
+    if not status_active:
+        print("[SOSYNC-E2EE-MIGRATION] stage=companionPairingHomeMigrationSkipped reason=inactivePairing", flush=True)
+        return {"accepted": False, "result": "rejected", "reason": "inactivePairing"}
+    if not device_id_matches:
+        print("[SOSYNC-E2EE-MIGRATION] stage=companionPairingHomeMigrationSkipped reason=deviceMismatch", flush=True)
+        return {"accepted": False, "result": "rejected", "reason": "deviceMismatch"}
+    if not client_key_matches:
+        print("[SOSYNC-E2EE-MIGRATION] stage=companionPairingHomeMigrationSkipped reason=publicKeyMismatch", flush=True)
+        return {"accepted": False, "result": "rejected", "reason": "publicKeyMismatch"}
+    if not companion_key_matches or not companion_identity_matches:
+        print("[SOSYNC-E2EE-MIGRATION] stage=companionPairingHomeMigrationSkipped reason=companionIdentityMismatch", flush=True)
+        return {"accepted": False, "result": "rejected", "reason": "companionIdentityMismatch"}
+    if legacy_home_mismatch and not local_server_identity_available:
+        print("[SOSYNC-E2EE-MIGRATION] stage=companionPairingHomeMigrationSkipped reason=missingTrustedLocalServerIdentity", flush=True)
+        return {"accepted": False, "result": "rejected", "reason": "missingTrustedLocalServerIdentity"}
+    if home_binding_matches:
+        print("[SOSYNC-E2EE-MIGRATION] stage=companionPairingHomeMigrationSkipped reason=alreadyCanonical", flush=True)
+        return {"accepted": True, "result": "noop", "reason": "alreadyCanonical"}
+
+    old_home_id = str(record.get("home_id") or "")
+    migrated = dict(record)
+    migrated["home_id"] = target_home_id
+    devices[device_id] = migrated
+    pairings["devices"] = devices
+    write_json_file_secure(E2EE_PAIRINGS_FILE, pairings)
+    readback = read_e2ee_pairings().get("devices", {}).get(device_id)
+    if not isinstance(readback, dict) or readback != migrated:
+        print("[SOSYNC-E2EE-MIGRATION] stage=companionPairingHomeMigrationSkipped reason=readbackMismatch", flush=True)
+        return {"accepted": False, "result": "rejected", "reason": "readbackMismatch"}
+    print(
+        "[SOSYNC-E2EE-MIGRATION] "
+        "stage=companionPairingHomeMigrated "
+        f"oldHomeHash={safe_fingerprint(old_home_id)} "
+        f"newHomeHash={safe_fingerprint(target_home_id)}",
+        flush=True
+    )
+    return {"accepted": True, "result": "migrated", "reason": "legacyHomeIdentity"}
 
 
 def secure_remote_public_status(binding=None):
