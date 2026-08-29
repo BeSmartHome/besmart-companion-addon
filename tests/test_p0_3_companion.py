@@ -154,7 +154,7 @@ class CompanionP03Tests(unittest.TestCase):
         dockerfile = (addon_root / "Dockerfile").read_text(encoding="utf-8")
         runtime = (addon_root / "app.py").read_text(encoding="utf-8")
 
-        self.assertIn('version: "1.0.30"', config)
+        self.assertIn('version: "1.0.32"', config)
         self.assertIn("e2ee_pairing_authorization", config)
         self.assertIn("COPY app.py /app/app.py", dockerfile)
         self.assertIn("CLOUDFLARED_VERSION=2026.8.2", dockerfile)
@@ -580,6 +580,119 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertIn("envelopeVersion=1", logs)
         self.assertIn("sequence=1", logs)
         self.assertIn("classification=data", logs)
+
+    def test_encrypted_websocket_does_not_block_identity_requests(self):
+        route_id = "r_abcdefghijklmnopqrstuvwxyz123456"
+        tunnel_id = "tun_abcdefghijklmnopqrstuvwxyz123456"
+        origin_token = "orig_abcdefghijklmnopqrstuvwxyz123456"
+        home_id = "home_ref"
+        device_id = "device_ref"
+        session_id = "session-concurrency"
+        upstream_stop = threading.Event()
+
+        class HoldingHAHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.headers.get("Upgrade", "").lower() == "websocket":
+                    self.send_response(101, "Switching Protocols")
+                    self.send_header("Upgrade", "websocket")
+                    self.send_header("Connection", "Upgrade")
+                    self.send_header("Sec-WebSocket-Accept", "diagnostic")
+                    self.end_headers()
+                    upstream_stop.wait(timeout=3)
+                    return
+                self.send_response(404)
+                self.end_headers()
+
+            def log_message(self, format, *args):
+                return
+
+        ha_server = ThreadingHTTPServer(("127.0.0.1", 0), HoldingHAHandler)
+        ha_thread = threading.Thread(target=ha_server.serve_forever, daemon=True)
+        ha_thread.start()
+        ha_host, ha_port = ha_server.server_address
+        original_read_ha_upstream = app.read_ha_upstream
+        app.read_ha_upstream = lambda: f"http://{ha_host}:{ha_port}"
+        device_private = x25519.X25519PrivateKey.generate()
+        device_public_key = app.base64url_encode(device_private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw))
+        device_ephemeral = x25519.X25519PrivateKey.generate()
+        device_ephemeral_public_key = app.base64url_encode(device_ephemeral.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw))
+        self._seed_e2ee_pairing(home_id, device_id, device_public_key)
+        binding = app.make_secure_remote_binding(
+            self._secure_remote_binding_request(
+                home_id,
+                device_id,
+                device_public_key,
+                route_id=route_id,
+                tunnel_binding_id=tunnel_id,
+                origin_access_token=origin_token
+            )
+        )
+        app.write_json_file_secure(app.SECURE_REMOTE_BINDING_FILE, binding)
+        app.create_secure_remote_dataplane_session(binding, {
+            "protocol_version": 1,
+            "route_id": route_id,
+            "session_id": session_id,
+            "home_id": home_id,
+            "device_id": device_id,
+            "device_public_key": device_public_key,
+            "device_ephemeral_public_key": device_ephemeral_public_key
+        })
+
+        ws_socket = None
+        try:
+            with self._server() as base_url:
+                host, port = base_url.split(":")
+                ws_socket = socket.create_connection((host, int(port)), timeout=2)
+                ws_socket.settimeout(2)
+                ws_socket.sendall(
+                    (
+                        f"GET /secure-remote/data-plane/e2ee/ws?session_id={session_id} HTTP/1.1\r\n"
+                        f"Host: {base_url}\r\n"
+                        "Connection: Upgrade\r\n"
+                        "Upgrade: websocket\r\n"
+                        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                        "Sec-WebSocket-Version: 13\r\n"
+                        f"X-SoSync-Secure-Remote-Route: {tunnel_id}\r\n"
+                        f"X-SoSync-Secure-Remote-Origin-Token: {origin_token}\r\n"
+                        "\r\n"
+                    ).encode("utf-8")
+                )
+                upgrade_response = ws_socket.recv(4096)
+                self.assertIn(b"101", upgrade_response.split(b"\r\n", 1)[0])
+
+                latencies = []
+                statuses = []
+                errors = []
+
+                def request_identity():
+                    started = time.monotonic()
+                    try:
+                        status, _ = self._request_json("GET", base_url, "/identity")
+                        statuses.append(status)
+                        latencies.append(time.monotonic() - started)
+                    except Exception as error:
+                        errors.append(error)
+
+                threads = [threading.Thread(target=request_identity) for _ in range(3)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=2)
+
+                self.assertFalse(errors)
+                self.assertEqual(sorted(statuses), [200, 200, 200])
+                self.assertEqual(len(latencies), 3)
+                self.assertLess(max(latencies), 1.5)
+        finally:
+            if ws_socket is not None:
+                try:
+                    ws_socket.close()
+                except OSError:
+                    pass
+            upstream_stop.set()
+            app.read_ha_upstream = original_read_ha_upstream
+            ha_server.shutdown()
+            ha_thread.join(timeout=2)
 
     def test_secure_remote_protected_endpoints_remain_authorized_and_unknown_path_is_marked(self):
         route_id = "r_abcdefghijklmnopqrstuvwxyz123456"

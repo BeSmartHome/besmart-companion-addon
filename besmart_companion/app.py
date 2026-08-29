@@ -77,13 +77,136 @@ SECURE_REMOTE_TUNNEL_PROCESS = None
 SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY = None
 SECURE_REMOTE_DATAPLANE_SESSIONS = {}
 SECURE_REMOTE_DATAPLANE_LOCK = threading.Lock()
+COMPANION_REQUEST_LOCK = threading.Lock()
+COMPANION_JSON_WRITE_LOCK = threading.Lock()
+COMPANION_IDENTITY_LOCK = threading.Lock()
+E2EE_IDENTITY_LOCK = threading.Lock()
+COMPANION_ACTIVE_HTTP_REQUESTS = 0
+COMPANION_ACTIVE_WEBSOCKETS = 0
+COMPANION_REQUEST_SEQUENCE = 0
 print(
     f"[SOSYNC-E2EE-COMPANION] runtimeGlobalsInitialized runtimeInstance={RUNTIME_INSTANCE_ID} build={SOSYNC_COMPANION_BUILD}",
     flush=True
 )
 
 
+def companion_path_class(path):
+    request_path = urlparse(path or "/").path
+    if request_path == "/identity":
+        return "identity"
+    if request_path == "/health":
+        return "health"
+    if request_path.startswith("/secure-remote/data-plane/e2ee/ws"):
+        return "secureRemoteEncryptedWebSocket"
+    if request_path.startswith("/secure-remote/data-plane/e2ee/session"):
+        return "secureRemoteEncryptedSession"
+    if request_path.startswith("/secure-remote/data-plane/e2ee/rest"):
+        return "secureRemoteEncryptedREST"
+    if request_path.startswith("/secure-remote/data-plane"):
+        return "secureRemoteDataPlane"
+    if request_path.startswith("/secure-remote"):
+        return "secureRemoteControlPlane"
+    if request_path.startswith("/security/e2ee"):
+        return "e2eeControlPlane"
+    if request_path.startswith("/remote/"):
+        return "legacyRemoteProxy"
+    return "other"
+
+
+def companion_request_started(method, path):
+    global COMPANION_ACTIVE_HTTP_REQUESTS
+    global COMPANION_REQUEST_SEQUENCE
+    with COMPANION_REQUEST_LOCK:
+        COMPANION_REQUEST_SEQUENCE += 1
+        request_id = COMPANION_REQUEST_SEQUENCE
+        COMPANION_ACTIVE_HTTP_REQUESTS += 1
+        active_http = COMPANION_ACTIVE_HTTP_REQUESTS
+        active_websockets = COMPANION_ACTIVE_WEBSOCKETS
+    print(
+        "[SOSYNC-COMPANION-REQUEST] "
+        f"stage=started requestID={request_id} method={method} "
+        f"pathClass={companion_path_class(path)} activeHTTP={active_http} "
+        f"activeWebSockets={active_websockets} thread={threading.get_ident()}",
+        flush=True
+    )
+    return request_id
+
+
+def companion_request_completed(request_id, method, path, started_at):
+    global COMPANION_ACTIVE_HTTP_REQUESTS
+    elapsed_ms = int((time.monotonic() - started_at) * 1000)
+    with COMPANION_REQUEST_LOCK:
+        COMPANION_ACTIVE_HTTP_REQUESTS = max(0, COMPANION_ACTIVE_HTTP_REQUESTS - 1)
+        active_http = COMPANION_ACTIVE_HTTP_REQUESTS
+        active_websockets = COMPANION_ACTIVE_WEBSOCKETS
+    print(
+        "[SOSYNC-COMPANION-REQUEST] "
+        f"stage=completed requestID={request_id} method={method} "
+        f"pathClass={companion_path_class(path)} activeHTTP={active_http} "
+        f"activeWebSockets={active_websockets} elapsedMs={elapsed_ms} "
+        f"thread={threading.get_ident()}",
+        flush=True
+    )
+
+
+def companion_websocket_started(route_id, session_id):
+    global COMPANION_ACTIVE_WEBSOCKETS
+    with COMPANION_REQUEST_LOCK:
+        COMPANION_ACTIVE_WEBSOCKETS += 1
+        active_http = COMPANION_ACTIVE_HTTP_REQUESTS
+        active_websockets = COMPANION_ACTIVE_WEBSOCKETS
+    print(
+        "[SOSYNC-COMPANION-REQUEST] "
+        f"stage=webSocketStarted route={safe_fingerprint(route_id)} "
+        f"session={safe_fingerprint(session_id)} activeHTTP={active_http} "
+        f"activeWebSockets={active_websockets} thread={threading.get_ident()}",
+        flush=True
+    )
+
+
+def companion_websocket_completed(route_id, session_id, started_at):
+    global COMPANION_ACTIVE_WEBSOCKETS
+    elapsed_ms = int((time.monotonic() - started_at) * 1000)
+    with COMPANION_REQUEST_LOCK:
+        COMPANION_ACTIVE_WEBSOCKETS = max(0, COMPANION_ACTIVE_WEBSOCKETS - 1)
+        active_http = COMPANION_ACTIVE_HTTP_REQUESTS
+        active_websockets = COMPANION_ACTIVE_WEBSOCKETS
+    print(
+        "[SOSYNC-COMPANION-REQUEST] "
+        f"stage=webSocketCompleted route={safe_fingerprint(route_id)} "
+        f"session={safe_fingerprint(session_id)} activeHTTP={active_http} "
+        f"activeWebSockets={active_websockets} elapsedMs={elapsed_ms} "
+        f"thread={threading.get_ident()}",
+        flush=True
+    )
+
+
 class Handler(BaseHTTPRequestHandler):
+    def parse_request(self):
+        parsed = super().parse_request()
+        if parsed:
+            self._sosync_request_started_at = time.monotonic()
+            self._sosync_request_id = companion_request_started(self.command, self.path)
+        return parsed
+
+    def handle_one_request(self):
+        self._sosync_request_id = None
+        self._sosync_request_started_at = None
+        try:
+            super().handle_one_request()
+        finally:
+            request_id = getattr(self, "_sosync_request_id", None)
+            started_at = getattr(self, "_sosync_request_started_at", None)
+            if request_id is not None and started_at is not None:
+                companion_request_completed(
+                    request_id,
+                    getattr(self, "command", "unknown"),
+                    getattr(self, "path", "unknown"),
+                    started_at
+                )
+                self._sosync_request_id = None
+                self._sosync_request_started_at = None
+
     def _json(self, status, payload, headers=None):
         body = json.dumps(payload).encode("utf-8")
         try:
@@ -741,7 +864,12 @@ class Handler(BaseHTTPRequestHandler):
                     f"[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionEncryptedWebSocketConnected route={safe_fingerprint(binding.get('route_id'))} encryptedDataPlane=true companionDecryption=true",
                     flush=True
                 )
-                bridge_secure_remote_dataplane_websocket(self.connection, upstream_socket, binding, session_id)
+                websocket_started_at = time.monotonic()
+                companion_websocket_started(binding.get("route_id"), session_id)
+                try:
+                    bridge_secure_remote_dataplane_websocket(self.connection, upstream_socket, binding, session_id)
+                finally:
+                    companion_websocket_completed(binding.get("route_id"), session_id, websocket_started_at)
         except Exception as error:
             print(f"[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionEncryptedWebSocketClosed reason={type(error).__name__}", flush=True)
             try:
@@ -2177,61 +2305,63 @@ def read_remote_token():
 
 
 def ensure_companion_identity():
-    identity = read_json_file(COMPANION_IDENTITY_FILE, None)
-    if (
-        isinstance(identity, dict) and
-        identity.get("companion_id") and
-        identity.get("companion_instance_id") and
-        identity.get("signing_public_key") and
-        identity.get("signing_private_key") and
-        identity.get("encryption_public_key") and
-        identity.get("encryption_private_key")
-    ):
+    with COMPANION_IDENTITY_LOCK:
+        identity = read_json_file(COMPANION_IDENTITY_FILE, None)
+        if (
+            isinstance(identity, dict) and
+            identity.get("companion_id") and
+            identity.get("companion_instance_id") and
+            identity.get("signing_public_key") and
+            identity.get("signing_private_key") and
+            identity.get("encryption_public_key") and
+            identity.get("encryption_private_key")
+        ):
+            return identity
+
+        signing_private_key = ed25519.Ed25519PrivateKey.generate()
+        signing_public_key = signing_private_key.public_key()
+        encryption_private_key = x25519.X25519PrivateKey.generate()
+        encryption_public_key = encryption_private_key.public_key()
+
+        identity = {
+            "protocol_version": 1,
+            "companion_id": str(uuid.uuid4()),
+            "companion_instance_id": str(uuid.uuid4()),
+            "signing_public_key": base64url_encode(signing_public_key.public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)),
+            "signing_private_key": base64url_encode(signing_private_key.private_bytes(Encoding.DER, PrivateFormat.PKCS8, NoEncryption())),
+            "encryption_public_key": base64url_encode(encryption_public_key.public_bytes(Encoding.Raw, PublicFormat.Raw)),
+            "encryption_private_key": base64url_encode(encryption_private_key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())),
+            "setup_counter": 0,
+            "minimum_protocol_version": 1,
+            "created_at": iso_now()
+        }
+        write_json_file_secure(COMPANION_IDENTITY_FILE, identity)
         return identity
-
-    signing_private_key = ed25519.Ed25519PrivateKey.generate()
-    signing_public_key = signing_private_key.public_key()
-    encryption_private_key = x25519.X25519PrivateKey.generate()
-    encryption_public_key = encryption_private_key.public_key()
-
-    identity = {
-        "protocol_version": 1,
-        "companion_id": str(uuid.uuid4()),
-        "companion_instance_id": str(uuid.uuid4()),
-        "signing_public_key": base64url_encode(signing_public_key.public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)),
-        "signing_private_key": base64url_encode(signing_private_key.private_bytes(Encoding.DER, PrivateFormat.PKCS8, NoEncryption())),
-        "encryption_public_key": base64url_encode(encryption_public_key.public_bytes(Encoding.Raw, PublicFormat.Raw)),
-        "encryption_private_key": base64url_encode(encryption_private_key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())),
-        "setup_counter": 0,
-        "minimum_protocol_version": 1,
-        "created_at": iso_now()
-    }
-    write_json_file_secure(COMPANION_IDENTITY_FILE, identity)
-    return identity
 
 
 def ensure_e2ee_identity():
-    identity = read_json_file(E2EE_IDENTITY_FILE, None)
-    if (
-        isinstance(identity, dict) and
-        identity.get("public_key") and
-        identity.get("private_key") and
-        identity.get("key_version")
-    ):
-        return identity
+    with E2EE_IDENTITY_LOCK:
+        identity = read_json_file(E2EE_IDENTITY_FILE, None)
+        if (
+            isinstance(identity, dict) and
+            identity.get("public_key") and
+            identity.get("private_key") and
+            identity.get("key_version")
+        ):
+            return identity
 
-    private_key = x25519.X25519PrivateKey.generate()
-    public_key = private_key.public_key()
-    identity = {
-        "protocol_version": E2EE_PROTOCOL_VERSION,
-        "algorithm": "X25519",
-        "public_key": base64url_encode(public_key.public_bytes(Encoding.Raw, PublicFormat.Raw)),
-        "private_key": base64url_encode(private_key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())),
-        "key_version": 1,
-        "created_at": iso_now()
-    }
-    write_json_file_secure(E2EE_IDENTITY_FILE, identity)
-    return identity
+        private_key = x25519.X25519PrivateKey.generate()
+        public_key = private_key.public_key()
+        identity = {
+            "protocol_version": E2EE_PROTOCOL_VERSION,
+            "algorithm": "X25519",
+            "public_key": base64url_encode(public_key.public_bytes(Encoding.Raw, PublicFormat.Raw)),
+            "private_key": base64url_encode(private_key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())),
+            "key_version": 1,
+            "created_at": iso_now()
+        }
+        write_json_file_secure(E2EE_IDENTITY_FILE, identity)
+        return identity
 
 
 def read_e2ee_pairings():
@@ -2575,12 +2705,20 @@ def read_json_file(path, default):
 
 def write_json_file_secure(path, payload):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    temporary_file = f"{path}.tmp"
-    with open(temporary_file, "w", encoding="utf-8") as file:
-        json.dump(payload, file, separators=(",", ":"))
-    os.chmod(temporary_file, 0o600)
-    os.replace(temporary_file, path)
-    os.chmod(path, 0o600)
+    temporary_file = f"{path}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
+    with COMPANION_JSON_WRITE_LOCK:
+        try:
+            with open(temporary_file, "w", encoding="utf-8") as file:
+                json.dump(payload, file, separators=(",", ":"))
+            os.chmod(temporary_file, 0o600)
+            os.replace(temporary_file, path)
+            os.chmod(path, 0o600)
+        finally:
+            try:
+                if os.path.exists(temporary_file):
+                    os.remove(temporary_file)
+            except OSError:
+                pass
 
 
 def read_secure_remote_binding():
