@@ -2692,7 +2692,7 @@ def migrate_e2ee_pairing_home_for_secure_remote_binding_if_needed(data):
     )
     if not lookup_found:
         print("[SOSYNC-E2EE-MIGRATION] stage=companionPairingHomeMigrationSkipped reason=missingPairing", flush=True)
-        return {"accepted": False, "result": "rejected", "reason": "missingPairing"}
+        return {"accepted": True, "result": "noop", "reason": "missingPairing"}
     if not status_active:
         print("[SOSYNC-E2EE-MIGRATION] stage=companionPairingHomeMigrationSkipped reason=inactivePairing", flush=True)
         return {"accepted": False, "result": "rejected", "reason": "inactivePairing"}
@@ -3364,13 +3364,42 @@ def main():
         binding["failure_reason"] = "missingCredentialOrProcess"
         binding["updated_at"] = iso_now()
         write_json_file_secure(SECURE_REMOTE_BINDING_FILE, binding)
+    bind_address = "0.0.0.0"
     print("[SOSYNC-E2EE-COMPANION] serverConstructionStarted", flush=True)
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    print(
+        f"[SOSYNC-COMPANION-LISTENER] state=starting bindAddress={bind_address} port={PORT} runtimeInstance={RUNTIME_INSTANCE_ID} reason=processStart",
+        flush=True
+    )
+    try:
+        server = ThreadingHTTPServer((bind_address, PORT), Handler)
+    except BaseException as error:
+        print(
+            f"[SOSYNC-COMPANION-LISTENER] state=failed bindAddress={bind_address} port={PORT} runtimeInstance={RUNTIME_INSTANCE_ID} reason={type(error).__name__}",
+            flush=True
+        )
+        raise
     print(f"BeSmart Companion listening on port {PORT}")
     print(f"[SOSYNC-E2EE-COMPANION] runtimeListening runtimeInstance={RUNTIME_INSTANCE_ID} port={PORT}", flush=True)
+    print(
+        f"[SOSYNC-COMPANION-LISTENER] state=listening bindAddress={bind_address} port={PORT} runtimeInstance={RUNTIME_INSTANCE_ID} reason=serveForeverStarting",
+        flush=True
+    )
     print("[SOSYNC-E2EE-COMPANION] routesRegistered identity=true pairingAuthorization=true pair=true revoke=true protocol=1", flush=True)
     print("[SOSYNC-SECURE-REMOTE-COMPANION] routesRegistered identity=true status=true provision=true tunnelInstall=true tunnelRotate=true revoke=true dataPlane=true", flush=True)
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    except BaseException as error:
+        print(
+            f"[SOSYNC-COMPANION-LISTENER] state=failed bindAddress={bind_address} port={PORT} runtimeInstance={RUNTIME_INSTANCE_ID} reason={type(error).__name__}",
+            flush=True
+        )
+        raise
+    finally:
+        print(
+            f"[SOSYNC-COMPANION-LISTENER] state=stopped bindAddress={bind_address} port={PORT} runtimeInstance={RUNTIME_INSTANCE_ID} reason=serveForeverExited",
+            flush=True
+        )
+        server.server_close()
 
 
 if __name__ == "__main__":
