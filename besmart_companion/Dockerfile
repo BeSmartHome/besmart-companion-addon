@@ -14,8 +14,7 @@ RUN apk add --no-cache \
     python3 \
     py3-pip \
     curl \
-    ca-certificates \
-    tailscale
+    ca-certificates
 
 RUN set -eux; \
     case "${TARGETARCH:-}" in \

@@ -4,9 +4,7 @@ set -e
 
 echo "Starting BeSmart Companion..."
 
-mkdir -p /data/tailscale
 mkdir -p /data/cloudflared
-mkdir -p /var/run/tailscale
 
 if [ -z "${BESMART_BACKEND_SIGNING_PUBLIC_KEY:-}" ] && [ -f /data/options.json ]; then
   BESMART_BACKEND_SIGNING_PUBLIC_KEY="$(python3 - <<'PY'
@@ -27,13 +25,6 @@ if [ -n "${BESMART_BACKEND_SIGNING_PUBLIC_KEY:-}" ]; then
 else
   echo "Backend signing public key not configured."
 fi
-
-tailscaled \
-  --tun=userspace-networking \
-  --state=/data/tailscale/tailscaled.state \
-  --socket=/var/run/tailscale/tailscaled.sock &
-
-sleep 3
 
 echo "Starting BeSmart API on port 8765..."
 

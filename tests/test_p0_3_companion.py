@@ -11,8 +11,8 @@ from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
-from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat, PublicFormat, load_der_public_key
+from cryptography.hazmat.primitives.asymmetric import x25519
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat, load_der_public_key
 from cryptography.exceptions import InvalidSignature
 
 import sys
@@ -25,7 +25,6 @@ class CompanionP03Tests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.data_dir = self.tmp.name
         self._patch_paths(self.data_dir)
-        self._patch_tailscale()
         app.SECURE_REMOTE_DATAPLANE_SESSIONS.clear()
         os.environ.pop("BESMART_BACKEND_SIGNING_PUBLIC_KEY", None)
 
@@ -154,14 +153,16 @@ class CompanionP03Tests(unittest.TestCase):
         dockerfile = (addon_root / "Dockerfile").read_text(encoding="utf-8")
         runtime = (addon_root / "app.py").read_text(encoding="utf-8")
 
-        self.assertIn('version: "1.0.33"', config)
+        self.assertIn('version: "1.0.34"', config)
         self.assertIn("e2ee_pairing_authorization", config)
         self.assertIn("COPY app.py /app/app.py", dockerfile)
         self.assertIn("CLOUDFLARED_VERSION=2026.8.2", dockerfile)
         self.assertIn("BESMART_CLOUDFLARED_BIN=/usr/local/bin/cloudflared", dockerfile)
+        self.assertNotIn("tailscale", dockerfile.lower())
         self.assertIn("ARG SOSYNC_COMPANION_VERSION", dockerfile)
         self.assertIn("ARG SOSYNC_COMPANION_BUILD", dockerfile)
         self.assertIn("/usr/local/bin/cloudflared --version", dockerfile)
+        self.assertIn('"error": "tailscale_retired"', runtime)
         self.assertIn('self.path == "/security/e2ee/identity"', runtime)
         self.assertIn('self.path == "/security/e2ee/pair"', runtime)
         self.assertIn('self.path == "/security/e2ee/revoke"', runtime)
@@ -260,65 +261,30 @@ class CompanionP03Tests(unittest.TestCase):
         self.assertEqual(status, 404)
         self.assertEqual(body["error"], "pairing_not_found")
 
-    def test_secure_connect_rejects_raw_auth_key_for_p0_3(self):
+    def test_tailscale_connect_is_retired(self):
         with self._server() as base_url:
             status, body = self._request_json("POST", base_url, "/tailscale/connect", {
                 "protocol_version": 1,
                 "auth_key": "tskey-raw"
             })
 
-        self.assertEqual(status, 400)
-        self.assertEqual(body["error"], "raw_auth_key_rejected")
+        self.assertEqual(status, 410)
+        self.assertEqual(body["error"], "tailscale_retired")
+        self.assertEqual(body["replacement"], "secure_remote_cloudflare")
 
-    def test_secure_connect_rejects_bad_signature_wrong_audience_and_replay(self):
-        backend_private = ed25519.Ed25519PrivateKey.generate()
-        backend_public = backend_private.public_key()
-        os.environ["BESMART_BACKEND_SIGNING_PUBLIC_KEY"] = app.base64url_encode(
-            backend_public.public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
-        )
-
-        identity = app.ensure_companion_identity()
+    def test_tailscale_setup_package_is_retired_without_mutation(self):
         app.store_server_id("srv_secure")
-        valid_package = self._make_setup_package(identity, backend_private, "srv_secure")
-        reused_connect = self._make_setup_package(identity, backend_private, "srv_secure", package_id="pkg-2", connect_id="connect-1")
-
-        tampered = dict(valid_package)
-        tampered["server_id"] = "srv_tampered"
-
-        wrong_identity = dict(identity)
-        wrong_identity["companion_id"] = "wrong-companion"
-        wrong_audience = self._make_setup_package(wrong_identity, backend_private, "srv_secure")
 
         with self._server() as base_url:
-            tampered_status, _ = self._request_json("POST", base_url, "/tailscale/connect", {
+            status, body = self._request_json("POST", base_url, "/tailscale/connect", {
                 "protocol_version": 1,
-                "setup_package": tampered
-            })
-            audience_status, _ = self._request_json("POST", base_url, "/tailscale/connect", {
-                "protocol_version": 1,
-                "setup_package": wrong_audience
-            })
-            first_status, first_body = self._request_json("POST", base_url, "/tailscale/connect", {
-                "protocol_version": 1,
-                "setup_package": valid_package
-            })
-            replay_status, _ = self._request_json("POST", base_url, "/tailscale/connect", {
-                "protocol_version": 1,
-                "setup_package": valid_package
-            })
-            connect_replay_status, _ = self._request_json("POST", base_url, "/tailscale/connect", {
-                "protocol_version": 1,
-                "setup_package": reused_connect
+                "setup_package": {"package_id": "legacy-package"}
             })
 
-        self.assertEqual(tampered_status, 401)
-        self.assertEqual(audience_status, 401)
-        self.assertEqual(first_status, 200)
-        self.assertNotIn("remote_token", first_body)
-        self.assertNotIn("tailscale_auth_key", first_body)
-        self.assertEqual(Path(app.REMOTE_TOKEN_FILE).read_text(encoding="utf-8"), "secure-token")
-        self.assertEqual(replay_status, 409)
-        self.assertEqual(connect_replay_status, 409)
+        self.assertEqual(status, 410)
+        self.assertEqual(body["error"], "tailscale_retired")
+        self.assertFalse(Path(app.REMOTE_TOKEN_FILE).exists())
+        self.assertFalse(Path(app.CONSUMED_PACKAGES_FILE).exists())
 
     def test_existing_remote_token_proxy_is_disabled(self):
         Path(app.REMOTE_TOKEN_FILE).write_text("expected-token", encoding="utf-8")
@@ -1539,12 +1505,6 @@ class CompanionP03Tests(unittest.TestCase):
         app.SECURE_REMOTE_BINDING_FILE = os.path.join(data_dir, "besmart_secure_remote_binding.json")
         app.CONSUMED_PACKAGES_FILE = os.path.join(data_dir, "besmart_consumed_setup_packages.json")
 
-    def _patch_tailscale(self):
-        app.read_tailscale_status = lambda: {"BackendState": "Running", "Self": {"DNSName": "besmart-home.example.ts.net."}}
-        app.read_tailscale_ip = lambda: "100.64.0.1"
-        app.run_tailscale_up = lambda auth_key, hostname, enable_funnel: {"ok": True}
-        app.enable_tailscale_funnel = lambda target: {"ok": True}
-
     def _patch_cloudflared_start(self, running=False, missing=False, stderr_message="", captured=None, raise_start=False):
         self._original_shutil_which = app.shutil.which
         self._original_popen = app.subprocess.Popen
@@ -1676,58 +1636,6 @@ class CompanionP03Tests(unittest.TestCase):
             credential_version=credential_version,
             origin_access_token=origin_access_token
         )
-
-    def _make_setup_package(self, identity, backend_private_key, server_id, package_id="pkg-1", connect_id="connect-1"):
-        suite = app.hpke_suite()
-        recipient = suite.kem.deserialize_public_key(app.base64url_decode(identity["encryption_public_key"]))
-        aad = app.canonicalize({
-            "protocol_version": 1,
-            "package_id": package_id,
-            "companion_id": identity["companion_id"],
-            "server_id": server_id
-        })
-        plaintext = {
-            "protocol_version": 1,
-            "connect_id": connect_id,
-            "server_id": server_id,
-            "hostname": "besmart-home",
-            "tailscale_auth_key": "tskey-secure",
-            "tailscale_auth_key_reusable": False,
-            "tailscale_auth_key_preauthorized": True,
-            "tailscale_auth_key_expires_at": app.iso_from_now(600),
-            "remote_token": "secure-token",
-            "serve_target_url": "http://127.0.0.1:8765",
-            "ha_upstream_url": "http://127.0.0.1:8123",
-            "expected_url": "https://besmart-home.example.ts.net/remote/ha",
-            "issued_at": app.iso_now(),
-            "expires_at": app.iso_from_now(600)
-        }
-        enc, context = suite.create_sender_context(
-            recipient,
-            info=app.SETUP_PACKAGE_INFO
-        )
-        ciphertext = context.seal(
-            json.dumps(plaintext, separators=(",", ":")).encode("utf-8"),
-            aad=aad.encode("utf-8")
-        )
-        envelope = {
-            "protocol_version": 1,
-            "package_id": package_id,
-            "companion_id": identity["companion_id"],
-            "server_id": server_id,
-            "issued_at": app.iso_now(),
-            "expires_at": app.iso_from_now(600),
-            "encryption_alg": app.SETUP_PACKAGE_ENCRYPTION_ALG,
-            "signature_alg": app.SETUP_PACKAGE_SIGNATURE_ALG,
-            "encapsulated_key": app.base64url_encode(enc),
-            "ciphertext": app.base64url_encode(ciphertext),
-            "aad": aad,
-            "backend_signature": ""
-        }
-        envelope["backend_signature"] = app.base64url_encode(
-            backend_private_key.sign(app.canonical_bytes(app.envelope_canonical_payload(envelope)))
-        )
-        return envelope
 
     class _server:
         def __init__(self_outer):

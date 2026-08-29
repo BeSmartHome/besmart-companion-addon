@@ -59,7 +59,6 @@ CONSUMED_PACKAGES_FILE = os.path.join(DATA_DIR, "besmart_consumed_setup_packages
 REMOTE_TOKEN_HEADER = "X-BeSmart-Remote-Token"
 HOME_PROFILE_PATH = "/besmart/home-profile"
 MAX_HOME_PROFILE_BYTES = 512 * 1024
-TAILSCALE_CONNECT_LOCK = threading.Lock()
 HOME_PROFILE_WRITE_LOCK = threading.Lock()
 PAIRING_TTL_SECONDS = 120
 E2EE_PROTOCOL_VERSION = 1
@@ -312,7 +311,7 @@ class Handler(BaseHTTPRequestHandler):
                 "build": SOSYNC_COMPANION_BUILD,
                 "server_id": get_or_create_server_id(),
                 "remote_url": read_remote_url(),
-                "tailscale_dns_name": tailscale_dns_name(read_tailscale_status()),
+                "tailscale_dns_name": None,
                 "cloudflared_available": cloudflared_runtime_status()["available"],
                 "cloudflared_version": cloudflared_runtime_status()["version"],
                 "tunnel_state": secure_remote_public_status()["tunnel_state"],
@@ -337,21 +336,10 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/tailscale/status":
-            result = subprocess.run(
-                ["tailscale", "status", "--json"],
-                capture_output=True,
-                text=True
-            )
-
-            try:
-                status_data = json.loads(result.stdout) if result.stdout else None
-            except json.JSONDecodeError:
-                status_data = None
-
-            self._json(200, {
-                "ok": result.returncode == 0,
-                "status": status_data,
-                "error": result.stderr or None
+            self._json(410, {
+                "ok": False,
+                "error": "tailscale_retired",
+                "replacement": "secure_remote_cloudflare"
             })
             return
 
@@ -464,91 +452,12 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/tailscale/connect":
-            try:
-                length = int(self.headers.get("Content-Length", "0"))
-                body = self.rfile.read(length)
-                data = json.loads(body.decode("utf-8") or "{}")
-            except Exception:
-                self._json(400, {"error": "invalid_json"})
-                return
-
-            if data.get("protocol_version") == 1 or data.get("setup_package") is not None:
-                self._handle_secure_tailscale_connect(data)
-                return
-
-            auth_key = data.get("auth_key")
-            server_id = data.get("server_id") or get_or_create_server_id()
-            hostname = data.get("hostname", "besmart-home")
-            enable_funnel = bool(data.get("enable_funnel", False))
-            serve_target_url = normalize_companion_target(data.get("serve_target_url"))
-            ha_upstream_url = normalize_ha_upstream(data.get("ha_upstream_url"))
-            remote_token = data.get("remote_token")
-            rotate_remote_token = bool(data.get("rotate_remote_token", False))
-            expected_url = data.get("expected_url")
-
-            if not auth_key:
-                self._json(400, {"error": "missing_auth_key"})
-                return
-
-            if enable_funnel and not remote_token:
-                self._json(400, {"error": "missing_remote_token"})
-                return
-
-            if not TAILSCALE_CONNECT_LOCK.acquire(blocking=False):
-                self._json(409, {
-                    "ok": False,
-                    "error": "tailscale_connect_in_progress",
-                    "message": "Remote access setup is already running. Wait for the current setup to finish.",
-                    "url": read_remote_url()
-                })
-                return
-
-            try:
-                current_status = read_tailscale_status()
-                reused_existing_login = tailscale_is_running(current_status)
-                if reused_existing_login:
-                    print(f"Reusing existing Tailscale login dns={tailscale_dns_name(current_status)}", flush=True)
-                else:
-                    up_result = run_tailscale_up(auth_key, hostname, enable_funnel)
-                    if not up_result.get("ok"):
-                        self._json(up_result.get("status", 500), up_result)
-                        return
-
-                ip = read_tailscale_ip()
-                funnel_url = None
-
-                if enable_funnel:
-                    effective_remote_token = remote_token if rotate_remote_token else (read_remote_token() or remote_token)
-                    store_server_id(server_id)
-                    store_remote_token(effective_remote_token)
-                    store_ha_upstream(ha_upstream_url)
-                    funnel_target = str(urlparse(serve_target_url).port or PORT)
-                    funnel_result = enable_tailscale_funnel(funnel_target)
-                    if not funnel_result.get("ok"):
-                        funnel_result["ip"] = ip
-                        self._json(funnel_result.get("status", 500), funnel_result)
-                        return
-
-                    funnel_url = tailscale_dns_url() or expected_url or read_remote_url()
-                    if funnel_url:
-                        store_remote_url(funnel_url)
-                        print(f"Tailscale Funnel configured url={funnel_url}", flush=True)
-
-                self._json(200, {
-                    "ok": True,
-                    "ip": ip,
-                    "server_id": server_id,
-                    "url": funnel_url or (f"http://{ip}:8123" if ip else None),
-                    "remote_token": read_remote_token(),
-                    "remote_token_rotated": rotate_remote_token,
-                    "remote_ready": False if funnel_url else None,
-                    "remote_ready_reason": "public_https_must_be_tested_by_client" if funnel_url else None,
-                    "serve_target_url": serve_target_url if enable_funnel else None,
-                    "ha_upstream_url": ha_upstream_url if enable_funnel else None
-                })
-                return
-            finally:
-                TAILSCALE_CONNECT_LOCK.release()
+            self._json(410, {
+                "ok": False,
+                "error": "tailscale_retired",
+                "replacement": "secure_remote_cloudflare"
+            })
+            return
 
         if self.path == "/pairing/consume":
             self._handle_pairing_consume()
@@ -1233,130 +1142,6 @@ class Handler(BaseHTTPRequestHandler):
         )
         self._json(200, receipt)
 
-    def _handle_secure_tailscale_connect(self, data):
-        if data.get("auth_key"):
-            self._json(400, {"ok": False, "error": "raw_auth_key_rejected"})
-            return
-
-        setup_package = data.get("setup_package")
-        if not isinstance(setup_package, dict):
-            self._json(400, {"ok": False, "error": "missing_setup_package"})
-            return
-
-        backend_public_key = read_backend_public_key()
-        if not backend_public_key:
-            self._json(500, {"ok": False, "error": "missing_backend_verification_key"})
-            return
-
-        if not TAILSCALE_CONNECT_LOCK.acquire(blocking=False):
-            self._json(409, {"ok": False, "error": "tailscale_connect_in_progress", "url": read_remote_url()})
-            return
-
-        try:
-            identity = ensure_companion_identity()
-            consumed = read_consumed_packages()
-            package_id = str(setup_package.get("package_id") or "")
-            if not package_id:
-                self._json(400, {"ok": False, "error": "missing_package_id"})
-                return
-            if consumed.get("package_ids", {}).get(package_id):
-                self._json(409, {"ok": False, "error": "setup_package_reused"})
-                return
-
-            if not verify_setup_package_envelope(setup_package, backend_public_key):
-                self._json(401, {"ok": False, "error": "invalid_setup_package_signature"})
-                return
-
-            if setup_package.get("companion_id") != identity.get("companion_id"):
-                self._json(401, {"ok": False, "error": "setup_package_audience_mismatch"})
-                return
-
-            if is_expired_iso(setup_package.get("expires_at")):
-                self._json(401, {"ok": False, "error": "setup_package_expired"})
-                return
-
-            try:
-                plaintext = decrypt_setup_package(setup_package, identity["encryption_private_key"])
-            except Exception:
-                self._json(401, {"ok": False, "error": "setup_package_decryption_failed"})
-                return
-
-            server_id = str(plaintext.get("server_id") or "")
-            current_server_id = get_or_create_server_id()
-            if setup_package.get("server_id") != server_id or (current_server_id and current_server_id != server_id):
-                self._json(401, {"ok": False, "error": "setup_package_server_mismatch"})
-                return
-
-            connect_id = str(plaintext.get("connect_id") or "")
-            if not connect_id:
-                self._json(400, {"ok": False, "error": "missing_connect_id"})
-                return
-            if consumed.get("connect_ids", {}).get(connect_id):
-                self._json(409, {"ok": False, "error": "connect_id_reused"})
-                return
-
-            if is_expired_iso(plaintext.get("expires_at")) or is_expired_iso(plaintext.get("tailscale_auth_key_expires_at")):
-                self._json(401, {"ok": False, "error": "setup_package_payload_expired"})
-                return
-
-            auth_key = str(plaintext.get("tailscale_auth_key") or "")
-            remote_token = str(plaintext.get("remote_token") or "")
-            hostname = sanitize_hostname(plaintext.get("hostname") or "besmart-home")
-            expected_url = str(plaintext.get("expected_url") or "")
-            serve_target_url = normalize_companion_target(plaintext.get("serve_target_url"))
-            ha_upstream_url = normalize_ha_upstream(plaintext.get("ha_upstream_url"))
-
-            if (
-                not auth_key or
-                not remote_token or
-                not hostname or
-                plaintext.get("tailscale_auth_key_reusable") is not False or
-                plaintext.get("tailscale_auth_key_preauthorized") is not True
-            ):
-                self._json(400, {"ok": False, "error": "invalid_setup_package_payload"})
-                return
-
-            current_status = read_tailscale_status()
-            reused_existing_login = tailscale_is_running(current_status)
-            if reused_existing_login:
-                print(f"Reusing existing Tailscale login dns={tailscale_dns_name(current_status)}", flush=True)
-            else:
-                up_result = run_tailscale_up(auth_key, hostname, True)
-                if not up_result.get("ok"):
-                    self._json(up_result.get("status", 500), {"ok": False, "error": up_result.get("error", "tailscale_up_failed")})
-                    return
-
-            ip = read_tailscale_ip()
-            store_server_id(server_id)
-            store_ha_upstream(ha_upstream_url)
-            funnel_target = str(urlparse(serve_target_url).port or PORT)
-            funnel_result = enable_tailscale_funnel(funnel_target)
-            if not funnel_result.get("ok"):
-                self._json(funnel_result.get("status", 500), {"ok": False, "error": funnel_result.get("error", "failed_to_enable_funnel")})
-                return
-
-            funnel_url = tailscale_dns_url() or expected_url or read_remote_url()
-            if funnel_url:
-                store_remote_url(funnel_url)
-                print(f"Tailscale Funnel configured url={funnel_url}", flush=True)
-
-            store_remote_token(remote_token)
-            consumed.setdefault("package_ids", {})[package_id] = iso_now()
-            consumed.setdefault("connect_ids", {})[connect_id] = iso_now()
-            write_json_file_secure(CONSUMED_PACKAGES_FILE, consumed)
-            identity["setup_counter"] = int(identity.get("setup_counter") or 0) + 1
-            write_json_file_secure(COMPANION_IDENTITY_FILE, identity)
-
-            self._json(200, {
-                "protocol_version": 1,
-                "status": "registered",
-                "server_id": server_id,
-                "url": funnel_url or (f"http://{ip}:8123" if ip else None),
-                "remote_token_fingerprint": remote_token_fingerprint(remote_token)
-            })
-        finally:
-            TAILSCALE_CONNECT_LOCK.release()
-
     def _reject_public_management_request(self):
         if self.path.startswith(REMOTE_PREFIX):
             return False
@@ -1364,10 +1149,6 @@ class Handler(BaseHTTPRequestHandler):
             return False
         if self.path == HOME_PROFILE_PATH:
             return False
-
-        if is_public_funnel_host(self.headers.get("Host", "")):
-            self._json(404, {"error": "not_found"})
-            return True
 
         return False
 
@@ -2151,11 +1932,6 @@ def is_websocket_upgrade(headers):
     return "upgrade" in connection.lower() and upgrade.lower() == "websocket"
 
 
-def is_public_funnel_host(host):
-    hostname = str(host or "").split(":", 1)[0].strip().lower().rstrip(".")
-    return hostname.endswith(".ts.net")
-
-
 def read_http_headers(source_socket):
     buffer = b""
     while b"\r\n\r\n" not in buffer:
@@ -2188,142 +1964,6 @@ def tunnel_sockets(client_socket, upstream_socket):
                 target.sendall(data)
             except OSError:
                 return
-
-
-def wait_for_remote_https_ready(remote_url, remote_token, timeout=150):
-    if not remote_url or not remote_token:
-        return {"ok": False, "error": "missing_remote_url_or_token"}
-
-    deadline = time.monotonic() + timeout
-    probe_url = f"{remote_url.rstrip('/')}/api/"
-    last_error = None
-    print(f"Waiting for Tailscale Funnel HTTPS url={probe_url}", flush=True)
-
-    while time.monotonic() < deadline:
-        request = urllib.request.Request(
-            probe_url,
-            headers={
-                REMOTE_TOKEN_HEADER: remote_token,
-                "Accept": "application/json"
-            }
-        )
-
-        try:
-            with urllib.request.urlopen(request, timeout=5) as response:
-                print(f"Tailscale Funnel HTTPS ready status={response.status}", flush=True)
-                return {"ok": True, "status": response.status}
-        except urllib.error.HTTPError as error:
-            if error.code in (401, 403):
-                print(f"Tailscale Funnel HTTPS ready status={error.code}", flush=True)
-                return {"ok": True, "status": error.code}
-            last_error = f"http_{error.code}"
-        except Exception as error:
-            last_error = str(error)
-
-        time.sleep(2)
-
-    print(f"Tailscale Funnel HTTPS not ready error={last_error}", flush=True)
-    return {"ok": False, "error": last_error or "timeout"}
-
-
-def run_tailscale_up(auth_key, hostname, enable_funnel):
-    print(f"Connecting Tailscale hostname={hostname} funnel={enable_funnel}", flush=True)
-    try:
-        result = subprocess.run(
-            [
-                "tailscale",
-                "up",
-                "--authkey", auth_key,
-                "--hostname", hostname,
-                "--accept-dns=true"
-            ],
-            capture_output=True,
-            text=True,
-            timeout=60
-        )
-    except subprocess.TimeoutExpired:
-        return {
-            "ok": False,
-            "status": 504,
-            "error": "tailscale_up_timeout"
-        }
-
-    print(f"tailscale up finished rc={result.returncode}", flush=True)
-    if result.returncode != 0:
-        return {
-            "ok": False,
-            "status": 500,
-            "error": result.stderr or result.stdout or "tailscale_up_failed"
-        }
-
-    return {"ok": True}
-
-
-def reset_tailscale_login():
-    print("Resetting stale Tailscale login", flush=True)
-    try:
-        result = subprocess.run(
-            ["tailscale", "logout"],
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-        print(f"tailscale logout finished rc={result.returncode}", flush=True)
-    except subprocess.TimeoutExpired:
-        print("tailscale logout timed out", flush=True)
-
-
-def enable_tailscale_funnel(funnel_target):
-    print(f"Enabling Tailscale Funnel target={funnel_target}", flush=True)
-    try:
-        result = subprocess.run(
-            [
-                "tailscale",
-                "funnel",
-                "--https=443",
-                "--bg",
-                "--yes",
-                funnel_target
-            ],
-            capture_output=True,
-            text=True,
-            timeout=60
-        )
-    except subprocess.TimeoutExpired:
-        status_result = subprocess.run(
-            ["tailscale", "funnel", "status", "--json"],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        return {
-            "ok": False,
-            "status": 504,
-            "error": "tailscale_funnel_timeout",
-            "funnel_status": status_result.stdout or None,
-            "funnel_status_error": status_result.stderr or None
-        }
-
-    print(f"tailscale funnel finished rc={result.returncode}", flush=True)
-    if result.returncode != 0:
-        return {
-            "ok": False,
-            "status": 500,
-            "error": result.stderr or result.stdout or "failed_to_enable_funnel"
-        }
-
-    return {"ok": True}
-
-
-def read_tailscale_ip():
-    result = subprocess.run(
-        ["tailscale", "ip", "-4"],
-        capture_output=True,
-        text=True,
-        timeout=10
-    )
-    lines = result.stdout.strip().splitlines()
-    return lines[0] if lines else None
 
 
 def store_remote_token(token):
@@ -3524,41 +3164,6 @@ def is_local_client(address):
         address.startswith("172.30.") or
         address.startswith("172.31.")
     )
-
-
-def tailscale_dns_url():
-    dns_name = tailscale_dns_name(read_tailscale_status())
-    if not dns_name:
-        return None
-
-    return f"https://{dns_name.rstrip('.')}{REMOTE_PREFIX}"
-
-
-def read_tailscale_status():
-    result = subprocess.run(
-        ["tailscale", "status", "--json"],
-        capture_output=True,
-        text=True
-    )
-    if result.returncode != 0 or not result.stdout:
-        return None
-
-    try:
-        return json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return None
-
-
-def tailscale_is_running(status_data):
-    return bool(status_data and status_data.get("BackendState") == "Running" and tailscale_dns_name(status_data))
-
-
-def tailscale_dns_name(status_data):
-    if not status_data:
-        return None
-
-    dns_name = status_data.get("Self", {}).get("DNSName")
-    return dns_name or None
 
 
 def main():
