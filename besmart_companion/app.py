@@ -215,7 +215,10 @@ class Handler(BaseHTTPRequestHandler):
         timing_started_at = self._session_timing_started_at() if should_log_session_send else None
         if should_log_session_send:
             self._log_e2ee_session_timing("sendJSONStarted", timing_started_at)
+            self._log_e2ee_session_timing("sendJSONBodySerializationStarted", timing_started_at)
         body = json.dumps(payload).encode("utf-8")
+        if should_log_session_send:
+            self._log_e2ee_session_timing("sendJSONBodySerializationCompleted", timing_started_at)
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
@@ -1476,11 +1479,13 @@ def create_secure_remote_dataplane_session(binding, request, request_id="unknown
         raise ValueError("invalid_dataplane_session")
 
     log_e2ee_session_timing(request_id, timing_started_at, "pairingLookupStarted")
+    log_e2ee_session_timing(request_id, timing_started_at, "pairingFileReadStarted")
     pairings = read_e2ee_pairings().get("devices", {})
+    log_e2ee_session_timing(request_id, timing_started_at, "pairingFileReadCompleted")
     pairing = pairings.get(device_id)
     log_e2ee_session_timing(request_id, timing_started_at, "pairingLookupCompleted")
     log_e2ee_session_timing(request_id, timing_started_at, "identityLookupStarted")
-    identity = ensure_e2ee_identity()
+    identity = ensure_e2ee_identity(request_id=request_id, timing_started_at=timing_started_at)
     log_e2ee_session_timing(request_id, timing_started_at, "identityLookupCompleted")
     lookup_found = bool(pairing)
     status_active = lookup_found and pairing.get("status") == "active"
@@ -1570,11 +1575,13 @@ def create_secure_remote_dataplane_session(binding, request, request_id="unknown
     }
     log_e2ee_session_timing(request_id, timing_started_at, "sessionObjectCreationCompleted")
     lock_started_at = time.monotonic()
+    log_e2ee_session_timing(request_id, timing_started_at, "dataplaneSessionLockWaitStarted")
     with SECURE_REMOTE_DATAPLANE_LOCK:
         lock_wait_ms = elapsed_ms_since(lock_started_at)
         log_e2ee_session_timing(request_id, timing_started_at, "dataplaneSessionLockAcquired", lock_wait_ms=lock_wait_ms)
+        log_e2ee_session_timing(request_id, timing_started_at, "dataplaneSessionStoreStarted")
         SECURE_REMOTE_DATAPLANE_SESSIONS[(route_id, session_id)] = session
-        log_e2ee_session_timing(request_id, timing_started_at, "dataplaneSessionStored")
+        log_e2ee_session_timing(request_id, timing_started_at, "dataplaneSessionStoreCompleted")
     return session
 
 
@@ -2061,9 +2068,23 @@ def ensure_companion_identity():
         return identity
 
 
-def ensure_e2ee_identity():
+def ensure_e2ee_identity(request_id=None, timing_started_at=None):
+    lock_started_at = time.monotonic() if timing_started_at is not None else None
+    if timing_started_at is not None:
+        log_e2ee_session_timing(request_id or "unknown", timing_started_at, "identityLockWaitStarted")
     with E2EE_IDENTITY_LOCK:
+        if timing_started_at is not None and lock_started_at is not None:
+            log_e2ee_session_timing(
+                request_id or "unknown",
+                timing_started_at,
+                "identityLockAcquired",
+                lock_wait_ms=elapsed_ms_since(lock_started_at)
+            )
+        if timing_started_at is not None:
+            log_e2ee_session_timing(request_id or "unknown", timing_started_at, "identityFileReadStarted")
         identity = read_json_file(E2EE_IDENTITY_FILE, None)
+        if timing_started_at is not None:
+            log_e2ee_session_timing(request_id or "unknown", timing_started_at, "identityFileReadCompleted")
         if (
             isinstance(identity, dict) and
             identity.get("public_key") and
@@ -2082,7 +2103,11 @@ def ensure_e2ee_identity():
             "key_version": 1,
             "created_at": iso_now()
         }
+        if timing_started_at is not None:
+            log_e2ee_session_timing(request_id or "unknown", timing_started_at, "identityFileWriteStarted")
         write_json_file_secure(E2EE_IDENTITY_FILE, identity)
+        if timing_started_at is not None:
+            log_e2ee_session_timing(request_id or "unknown", timing_started_at, "identityFileWriteCompleted")
         return identity
 
 

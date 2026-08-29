@@ -716,17 +716,44 @@ class CompanionP03Tests(unittest.TestCase):
             except Exception as error:
                 errors.append(error)
 
-        with self._server() as base_url:
-            threads = [threading.Thread(target=request_session, args=(index,)) for index in range(3)]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join(timeout=3)
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            with self._server() as base_url:
+                threads = [threading.Thread(target=request_session, args=(index,)) for index in range(3)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=3)
 
         self.assertFalse(errors)
         self.assertEqual(sorted(statuses), [200, 200, 200])
         self.assertEqual(len(latencies), 3)
         self.assertLess(max(latencies), 2.0)
+        logs = captured.getvalue()
+        self.assertIn("[SOSYNC-E2EE-SESSION-TIMING] requestID=", logs)
+        for stage in (
+            "afterOriginValidation",
+            "bodyParseStarted",
+            "bodyParseCompleted",
+            "pairingFileReadStarted",
+            "pairingFileReadCompleted",
+            "identityLockWaitStarted",
+            "identityLockAcquired",
+            "cryptoKeyDerivationStarted",
+            "cryptoKeyDerivationCompleted",
+            "dataplaneSessionLockWaitStarted",
+            "dataplaneSessionLockAcquired",
+            "dataplaneSessionStoreCompleted",
+            "responseSerializationCompleted",
+            "beforeSendJSON",
+            "sendJSONStarted",
+            "headersWritten",
+            "bodyWriteStarted",
+            "bodyWriteCompleted",
+            "sendJSONCompleted",
+            "afterSendJSON",
+        ):
+            self.assertIn(f"stage={stage}", logs)
 
     def test_secure_remote_protected_endpoints_remain_authorized_and_unknown_path_is_marked(self):
         route_id = "r_abcdefghijklmnopqrstuvwxyz123456"
