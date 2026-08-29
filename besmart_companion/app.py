@@ -99,6 +99,8 @@ COMPANION_ACTIVE_WEBSOCKETS = 0
 COMPANION_REQUEST_SEQUENCE = 0
 COMPANION_IDENTITY_CACHE = None
 E2EE_IDENTITY_CACHE = None
+E2EE_PUBLIC_KEY_NORMALIZATION_CACHE = {}
+E2EE_PUBLIC_KEY_NORMALIZATION_LOCK = threading.Lock()
 COMPANION_JSON_READ_CACHE = {}
 CLOUDFLARED_RUNTIME_STATUS_CACHE = None
 CLOUDFLARED_RUNTIME_STATUS_CACHE_EXPIRES_AT = 0
@@ -1636,7 +1638,14 @@ def log_e2ee_session_timing(request_id, timing_started_at, stage, lock_wait_ms=N
 
 def create_secure_remote_dataplane_session(binding, request, request_id="unknown", timing_started_at=None):
     log_e2ee_session_timing(request_id, timing_started_at, "sessionValidationEntered")
+    companion_dataplane_checkpoint("sessionProtocolCheckStart", request_id, timing_started_at)
     protocol_matches = request.get("protocol_version") == 1
+    companion_dataplane_checkpoint(
+        "sessionProtocolCheckComplete",
+        request_id,
+        timing_started_at,
+        protocolMatches=str(protocol_matches).lower()
+    )
     if not protocol_matches:
         log_e2ee_session_timing(request_id, timing_started_at, "sessionPairingValidation")
         print(
@@ -1654,12 +1663,40 @@ def create_secure_remote_dataplane_session(binding, request, request_id="unknown
             flush=True
         )
         raise ValueError("unsupported_protocol_version")
+    companion_dataplane_checkpoint("sessionFieldExtractionStart", request_id, timing_started_at)
     route_id = str(request.get("route_id") or "")
     session_id = str(request.get("session_id") or "")
     device_id = str(request.get("device_id") or "")
     home_id = str(request.get("home_id") or "")
+    companion_dataplane_checkpoint(
+        "sessionFieldExtractionComplete",
+        request_id,
+        timing_started_at,
+        hasRouteID=str(bool(route_id)).lower(),
+        hasSessionID=str(bool(session_id)).lower(),
+        hasDeviceID=str(bool(device_id)).lower(),
+        hasHomeID=str(bool(home_id)).lower()
+    )
+    public_key_started_at = time.monotonic()
+    companion_dataplane_checkpoint("sessionDevicePublicKeyNormalizeStart", request_id, timing_started_at)
     device_public_key = normalized_e2ee_public_key(request.get("device_public_key"))
+    companion_dataplane_checkpoint(
+        "sessionDevicePublicKeyNormalizeComplete",
+        request_id,
+        timing_started_at,
+        segmentElapsedMs=elapsed_ms_since(public_key_started_at),
+        valid=str(bool(device_public_key)).lower()
+    )
+    ephemeral_key_started_at = time.monotonic()
+    companion_dataplane_checkpoint("sessionEphemeralPublicKeyNormalizeStart", request_id, timing_started_at)
     device_ephemeral_public_key = normalized_e2ee_public_key(request.get("device_ephemeral_public_key"))
+    companion_dataplane_checkpoint(
+        "sessionEphemeralPublicKeyNormalizeComplete",
+        request_id,
+        timing_started_at,
+        segmentElapsedMs=elapsed_ms_since(ephemeral_key_started_at),
+        valid=str(bool(device_ephemeral_public_key)).lower()
+    )
     log_e2ee_session_timing(request_id, timing_started_at, "sessionBindingParsed")
     if route_id != binding.get("route_id") or not session_id or not device_id or not device_public_key or not device_ephemeral_public_key:
         log_e2ee_session_timing(request_id, timing_started_at, "sessionPairingValidation")
@@ -2394,12 +2431,16 @@ def ensure_companion_identity():
 def ensure_e2ee_identity(request_id=None, timing_started_at=None):
     global E2EE_IDENTITY_CACHE
     if isinstance(E2EE_IDENTITY_CACHE, dict):
+        if timing_started_at is not None:
+            log_e2ee_session_timing(request_id or "unknown", timing_started_at, "identityCacheHit")
         return copy_json_value(E2EE_IDENTITY_CACHE)
     lock_started_at = time.monotonic() if timing_started_at is not None else None
     if timing_started_at is not None:
         log_e2ee_session_timing(request_id or "unknown", timing_started_at, "identityLockWaitStarted")
     with timed_lock(E2EE_IDENTITY_LOCK, "e2eeIdentity", request_id=request_id or "none", log_threshold_ms=5):
         if isinstance(E2EE_IDENTITY_CACHE, dict):
+            if timing_started_at is not None:
+                log_e2ee_session_timing(request_id or "unknown", timing_started_at, "identityCacheHitAfterLock")
             return copy_json_value(E2EE_IDENTITY_CACHE)
         if timing_started_at is not None and lock_started_at is not None:
             log_e2ee_session_timing(
@@ -2439,6 +2480,24 @@ def ensure_e2ee_identity(request_id=None, timing_started_at=None):
             log_e2ee_session_timing(request_id or "unknown", timing_started_at, "identityFileWriteCompleted")
         E2EE_IDENTITY_CACHE = copy_json_value(identity)
         return copy_json_value(identity)
+
+
+def prewarm_e2ee_identity_cache():
+    started_at = time.monotonic()
+    try:
+        identity = ensure_e2ee_identity()
+        companion_perf_log(
+            "e2eeIdentityPrewarmCompleted",
+            elapsedMs=elapsed_ms_since(started_at),
+            cacheReady=str(isinstance(E2EE_IDENTITY_CACHE, dict)).lower(),
+            keyVersion=str(identity.get("key_version") or "unknown") if isinstance(identity, dict) else "unknown"
+        )
+    except BaseException as error:
+        companion_perf_log(
+            "e2eeIdentityPrewarmFailed",
+            elapsedMs=elapsed_ms_since(started_at),
+            error=type(error).__name__
+        )
 
 
 def read_e2ee_pairings():
@@ -2626,12 +2685,21 @@ def opaque_e2ee_identifier(value):
 
 def normalized_e2ee_public_key(value):
     candidate = str(value or "").strip()
+    if not candidate:
+        return ""
+    with timed_lock(E2EE_PUBLIC_KEY_NORMALIZATION_LOCK, "e2eePublicKeyNormalizationCache", log_threshold_ms=5):
+        cached = E2EE_PUBLIC_KEY_NORMALIZATION_CACHE.get(candidate)
+    if cached is not None:
+        return cached
     try:
         raw = base64url_decode(candidate)
         if len(raw) != 32:
             return ""
         x25519.X25519PublicKey.from_public_bytes(raw)
-        return base64url_encode(raw)
+        normalized = base64url_encode(raw)
+        with timed_lock(E2EE_PUBLIC_KEY_NORMALIZATION_LOCK, "e2eePublicKeyNormalizationCache", log_threshold_ms=5):
+            E2EE_PUBLIC_KEY_NORMALIZATION_CACHE[candidate] = normalized
+        return normalized
     except (ValueError, TypeError):
         return ""
 
@@ -3639,6 +3707,7 @@ def main():
     print(f"[SOSYNC-E2EE-COMPANION] runtimeStarted runtimeInstance={RUNTIME_INSTANCE_ID} build={SOSYNC_COMPANION_BUILD}", flush=True)
     log_e2ee_pairing_store_loaded()
     log_pairing_authorization_loaded()
+    prewarm_e2ee_identity_cache()
     binding = read_secure_remote_binding()
     if binding.get("route_id") and read_secure_text_file(secure_remote_tunnel_token_file()):
         start_result = start_secure_remote_tunnel(binding)
