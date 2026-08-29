@@ -181,6 +181,10 @@ def companion_websocket_completed(route_id, session_id, started_at):
     )
 
 
+def elapsed_ms_since(started_at):
+    return int((time.monotonic() - started_at) * 1000)
+
+
 class Handler(BaseHTTPRequestHandler):
     def parse_request(self):
         parsed = super().parse_request()
@@ -208,6 +212,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._sosync_request_started_at = None
 
     def _json(self, status, payload, headers=None):
+        should_log_session_send = companion_path_class(getattr(self, "path", "")) == "secureRemoteEncryptedSession"
+        timing_started_at = self._session_timing_started_at() if should_log_session_send else None
+        if should_log_session_send:
+            self._log_e2ee_session_timing("sendJSONStarted", timing_started_at)
         body = json.dumps(payload).encode("utf-8")
         try:
             self.send_response(status)
@@ -216,9 +224,34 @@ class Handler(BaseHTTPRequestHandler):
             for name, value in (headers or {}).items():
                 self.send_header(name, value)
             self.end_headers()
+            if should_log_session_send:
+                self._log_e2ee_session_timing("headersWritten", timing_started_at)
+                self._log_e2ee_session_timing("bodyWriteStarted", timing_started_at)
             self.wfile.write(body)
+            if should_log_session_send:
+                self._log_e2ee_session_timing("bodyWriteCompleted", timing_started_at)
+                self._log_e2ee_session_timing("sendJSONCompleted", timing_started_at)
         except BrokenPipeError:
+            if should_log_session_send:
+                self._log_e2ee_session_timing("sendJSONFailedBrokenPipe", timing_started_at)
             print(f"Client disconnected before JSON response status={status}", flush=True)
+
+    def _request_id_for_log(self):
+        return getattr(self, "_sosync_request_id", "unknown") or "unknown"
+
+    def _session_timing_started_at(self):
+        return getattr(self, "_sosync_request_started_at", None) or time.monotonic()
+
+    def _log_e2ee_session_timing(self, stage, started_at, lock_wait_ms=None):
+        message = (
+            "[SOSYNC-E2EE-SESSION-TIMING] "
+            f"requestID={self._request_id_for_log()} "
+            f"stage={stage} "
+            f"elapsedMs={elapsed_ms_since(started_at)}"
+        )
+        if lock_wait_ms is not None:
+            message += f" lockWaitMs={lock_wait_ms}"
+        print(message, flush=True)
 
     def log_message(self, format, *args):
         print(f"{self.client_address[0]} - {format % args}")
@@ -788,28 +821,46 @@ class Handler(BaseHTTPRequestHandler):
         return binding
 
     def _handle_secure_remote_dataplane_session(self):
+        timing_started_at = self._session_timing_started_at()
         binding = self._authorize_secure_remote_dataplane()
         if not binding:
             return
+        self._log_e2ee_session_timing("afterOriginValidation", timing_started_at)
         try:
+            self._log_e2ee_session_timing("bodyParseStarted", timing_started_at)
             data = self._read_json_body(16 * 1024)
-            session = create_secure_remote_dataplane_session(binding, data)
+            self._log_e2ee_session_timing("bodyParseCompleted", timing_started_at)
+            session = create_secure_remote_dataplane_session(
+                binding,
+                data,
+                request_id=self._request_id_for_log(),
+                timing_started_at=timing_started_at
+            )
             print(
                 f"[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionEncryptedSessionReady route={safe_fingerprint(binding.get('route_id'))} session={safe_fingerprint(session['session_id'])} encryptedDataPlane=true companionDecryption=true replayProtection=true maxRevocationEnforcementSeconds=60",
                 flush=True
             )
-            self._json(200, {
+            self._log_e2ee_session_timing("responseSerializationStarted", timing_started_at)
+            response_payload = {
                 "protocol_version": 1,
                 "route_id": binding.get("route_id"),
                 "session_id": session["session_id"],
                 "companion_ephemeral_public_key": session["companion_ephemeral_public_key"],
                 "expires_in_seconds": session["expires_in_seconds"]
-            })
+            }
+            self._log_e2ee_session_timing("responseSerializationCompleted", timing_started_at)
+            self._log_e2ee_session_timing("beforeSendJSON", timing_started_at)
+            self._json(200, response_payload)
+            self._log_e2ee_session_timing("afterSendJSON", timing_started_at)
         except ValueError as error:
+            self._log_e2ee_session_timing("beforeErrorSendJSON", timing_started_at)
             self._json(400, {"error": str(error)})
+            self._log_e2ee_session_timing("afterErrorSendJSON", timing_started_at)
         except Exception as error:
             print(f"[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionEncryptedSessionRejected reason={type(error).__name__}", flush=True)
+            self._log_e2ee_session_timing("beforeErrorSendJSON", timing_started_at)
             self._json(403, {"error": "encrypted_session_rejected"})
+            self._log_e2ee_session_timing("afterErrorSendJSON", timing_started_at)
 
     def _handle_secure_remote_dataplane_rest(self):
         binding = self._authorize_secure_remote_dataplane()
@@ -1584,9 +1635,25 @@ class Handler(BaseHTTPRequestHandler):
         return is_local_client(self.client_address[0])
 
 
-def create_secure_remote_dataplane_session(binding, request):
+def log_e2ee_session_timing(request_id, timing_started_at, stage, lock_wait_ms=None):
+    if timing_started_at is None:
+        return
+    message = (
+        "[SOSYNC-E2EE-SESSION-TIMING] "
+        f"requestID={request_id} "
+        f"stage={stage} "
+        f"elapsedMs={elapsed_ms_since(timing_started_at)}"
+    )
+    if lock_wait_ms is not None:
+        message += f" lockWaitMs={lock_wait_ms}"
+    print(message, flush=True)
+
+
+def create_secure_remote_dataplane_session(binding, request, request_id="unknown", timing_started_at=None):
+    log_e2ee_session_timing(request_id, timing_started_at, "sessionValidationEntered")
     protocol_matches = request.get("protocol_version") == 1
     if not protocol_matches:
+        log_e2ee_session_timing(request_id, timing_started_at, "sessionPairingValidation")
         print(
             "[SOSYNC-E2EE-REMOTE-PAIRING] "
             "stage=sessionPairingValidation "
@@ -1608,7 +1675,9 @@ def create_secure_remote_dataplane_session(binding, request):
     home_id = str(request.get("home_id") or "")
     device_public_key = normalized_e2ee_public_key(request.get("device_public_key"))
     device_ephemeral_public_key = normalized_e2ee_public_key(request.get("device_ephemeral_public_key"))
+    log_e2ee_session_timing(request_id, timing_started_at, "sessionBindingParsed")
     if route_id != binding.get("route_id") or not session_id or not device_id or not device_public_key or not device_ephemeral_public_key:
+        log_e2ee_session_timing(request_id, timing_started_at, "sessionPairingValidation")
         print(
             "[SOSYNC-E2EE-REMOTE-PAIRING] "
             "stage=sessionPairingValidation "
@@ -1625,9 +1694,13 @@ def create_secure_remote_dataplane_session(binding, request):
         )
         raise ValueError("invalid_dataplane_session")
 
+    log_e2ee_session_timing(request_id, timing_started_at, "pairingLookupStarted")
     pairings = read_e2ee_pairings().get("devices", {})
     pairing = pairings.get(device_id)
+    log_e2ee_session_timing(request_id, timing_started_at, "pairingLookupCompleted")
+    log_e2ee_session_timing(request_id, timing_started_at, "identityLookupStarted")
     identity = ensure_e2ee_identity()
+    log_e2ee_session_timing(request_id, timing_started_at, "identityLookupCompleted")
     lookup_found = bool(pairing)
     status_active = lookup_found and pairing.get("status") == "active"
     device_id_matches = lookup_found and pairing.get("device_id") == device_id
@@ -1663,6 +1736,7 @@ def create_secure_remote_dataplane_session(binding, request):
         failure_field = "deviceID"
     elif not companion_key_version_matches:
         failure_field = "companionKeyVersion"
+    log_e2ee_session_timing(request_id, timing_started_at, "sessionPairingValidation")
     print(
         "[SOSYNC-E2EE-REMOTE-PAIRING] "
         "stage=sessionPairingValidation "
@@ -1682,6 +1756,7 @@ def create_secure_remote_dataplane_session(binding, request):
     if pairing.get("home_id") != home_id or pairing.get("device_public_key") != device_public_key:
         raise ValueError("pairing_mismatch")
 
+    log_e2ee_session_timing(request_id, timing_started_at, "cryptoKeyDerivationStarted")
     companion_ephemeral = x25519.X25519PrivateKey.generate()
     companion_ephemeral_public_key = base64url_encode(companion_ephemeral.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw))
     shared = x25519.X25519PrivateKey.from_private_bytes(base64url_decode(identity["private_key"])).exchange(
@@ -1697,6 +1772,8 @@ def create_secure_remote_dataplane_session(binding, request):
         device_ephemeral_public_key,
         companion_ephemeral_public_key
     )
+    log_e2ee_session_timing(request_id, timing_started_at, "cryptoKeyDerivationCompleted")
+    log_e2ee_session_timing(request_id, timing_started_at, "sessionObjectCreationStarted")
     session = {
         "session_id": session_id,
         "route_id": route_id,
@@ -1710,8 +1787,13 @@ def create_secure_remote_dataplane_session(binding, request):
         "expires_at": time.time() + 60,
         "expires_in_seconds": 60
     }
+    log_e2ee_session_timing(request_id, timing_started_at, "sessionObjectCreationCompleted")
+    lock_started_at = time.monotonic()
     with SECURE_REMOTE_DATAPLANE_LOCK:
+        lock_wait_ms = elapsed_ms_since(lock_started_at)
+        log_e2ee_session_timing(request_id, timing_started_at, "dataplaneSessionLockAcquired", lock_wait_ms=lock_wait_ms)
         SECURE_REMOTE_DATAPLANE_SESSIONS[(route_id, session_id)] = session
+        log_e2ee_session_timing(request_id, timing_started_at, "dataplaneSessionStored")
     return session
 
 
