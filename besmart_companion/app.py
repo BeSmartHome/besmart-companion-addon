@@ -79,6 +79,14 @@ SECURE_REMOTE_TUNNEL_STARTING = False
 SECURE_REMOTE_DATAPLANE_SESSIONS = {}
 SECURE_REMOTE_DATAPLANE_LOCK = threading.Lock()
 SECURE_REMOTE_DATAPLANE_REVOCATION_POLL_SECONDS = 1.0
+SECURE_REMOTE_BINDING_STATS = {
+    "bindingChecks": 0,
+    "diskReads": 0,
+    "cacheHits": 0,
+    "revocationPolls": 0,
+    "lastSummaryAt": time.monotonic()
+}
+SECURE_REMOTE_BINDING_STATS_LOCK = threading.Lock()
 SECURE_REMOTE_WS_LOG_COUNTS = {}
 SECURE_REMOTE_WS_LOG_LOCK = threading.Lock()
 COMPANION_REQUEST_LOCK = threading.Lock()
@@ -218,6 +226,50 @@ def companion_perf_log(event, **fields):
 def companion_perf_log_if_slow(event, elapsed_ms, threshold_ms=25, **fields):
     if elapsed_ms >= threshold_ms:
         companion_perf_log(event, elapsedMs=elapsed_ms, **fields)
+
+
+def companion_dataplane_checkpoint(event, request_id, started_at, **fields):
+    started_at = started_at or time.monotonic()
+    active_http, active_websockets = companion_runtime_counts_unlocked()
+    parts = [
+        "[SOSYNC-COMPANION-DATAPLANE-TIMING]",
+        f"event={event}",
+        f"requestID={request_id}",
+        f"elapsedMs={elapsed_ms_since(started_at)}",
+        f"thread={threading.get_ident()}",
+        f"activeHTTP={active_http}",
+        f"activeWebSockets={active_websockets}",
+    ]
+    for key, value in fields.items():
+        parts.append(f"{key}={value}")
+    print(" ".join(parts), flush=True)
+
+
+def note_secure_remote_binding_stat(kind, count=1):
+    now = time.monotonic()
+    summary = None
+    with timed_lock(SECURE_REMOTE_BINDING_STATS_LOCK, "bindingStats", log_threshold_ms=10):
+        SECURE_REMOTE_BINDING_STATS[kind] = SECURE_REMOTE_BINDING_STATS.get(kind, 0) + count
+        if now - SECURE_REMOTE_BINDING_STATS.get("lastSummaryAt", now) >= 30:
+            SECURE_REMOTE_BINDING_STATS["lastSummaryAt"] = now
+            summary = {
+                "bindingChecks": SECURE_REMOTE_BINDING_STATS.get("bindingChecks", 0),
+                "diskReads": SECURE_REMOTE_BINDING_STATS.get("diskReads", 0),
+                "cacheHits": SECURE_REMOTE_BINDING_STATS.get("cacheHits", 0),
+                "revocationPolls": SECURE_REMOTE_BINDING_STATS.get("revocationPolls", 0)
+            }
+            SECURE_REMOTE_BINDING_STATS["bindingChecks"] = 0
+            SECURE_REMOTE_BINDING_STATS["diskReads"] = 0
+            SECURE_REMOTE_BINDING_STATS["cacheHits"] = 0
+            SECURE_REMOTE_BINDING_STATS["revocationPolls"] = 0
+    if summary:
+        companion_perf_log(
+            "secureRemoteBindingSummary",
+            bindingChecks=summary["bindingChecks"],
+            diskReads=summary["diskReads"],
+            cacheHits=summary["cacheHits"],
+            revocationPolls=summary["revocationPolls"]
+        )
 
 
 @contextmanager
@@ -811,8 +863,14 @@ class Handler(BaseHTTPRequestHandler):
         )
         self._json(200, secure_remote_public_status(binding))
 
-    def _authorize_secure_remote_dataplane(self):
+    def _authorize_secure_remote_dataplane(self, timing_started_at=None):
+        request_id = self._request_id_for_log()
+        if timing_started_at is not None:
+            companion_dataplane_checkpoint("bindingReadStart", request_id, timing_started_at)
         binding = read_secure_remote_binding()
+        if timing_started_at is not None:
+            companion_dataplane_checkpoint("bindingReadComplete", request_id, timing_started_at)
+            companion_dataplane_checkpoint("authOriginValidationStart", request_id, timing_started_at)
         if not binding.get("route_id") or binding.get("status") == "revoked":
             print(
                 "[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionOriginValidation routeValidationPassed=false originTokenValidationPassed=false reason=notBound",
@@ -829,6 +887,8 @@ class Handler(BaseHTTPRequestHandler):
             f"[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionOriginValidation route={safe_fingerprint(binding.get('route_id'))} tunnelBinding={safe_fingerprint(binding.get('tunnel_binding_id'))} routeValidationPassed={route_ok} originTokenValidationPassed={token_ok}",
             flush=True
         )
+        if timing_started_at is not None:
+            companion_dataplane_checkpoint("authOriginValidationComplete", request_id, timing_started_at, routeOK=str(route_ok).lower(), tokenOK=str(token_ok).lower())
         if not route_ok or not token_ok:
             self._json(401, {"error": "unauthorized"}, headers={
                 "X-SoSync-Origin": "companion",
@@ -839,13 +899,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_secure_remote_dataplane_session(self):
         timing_started_at = self._session_timing_started_at()
-        binding = self._authorize_secure_remote_dataplane()
+        request_id = self._request_id_for_log()
+        companion_dataplane_checkpoint("requestEntered", request_id, timing_started_at)
+        companion_dataplane_checkpoint("dependenciesLoadStart", request_id, timing_started_at)
+        companion_dataplane_checkpoint("dependenciesLoadComplete", request_id, timing_started_at)
+        binding = self._authorize_secure_remote_dataplane(timing_started_at=timing_started_at)
         if not binding:
             return
         self._log_e2ee_session_timing("afterOriginValidation", timing_started_at)
         try:
-            self._log_e2ee_session_timing("bodyParseStarted", timing_started_at)
+            companion_dataplane_checkpoint("requestBodyReadStart", request_id, timing_started_at)
             data = self._read_json_body(16 * 1024)
+            companion_dataplane_checkpoint("requestBodyReadComplete", request_id, timing_started_at)
             self._log_e2ee_session_timing("bodyParseCompleted", timing_started_at)
             session = create_secure_remote_dataplane_session(
                 binding,
@@ -905,28 +970,38 @@ class Handler(BaseHTTPRequestHandler):
             self._json(403, {"error": "encrypted_dataplane_rejected"})
 
     def _handle_secure_remote_dataplane_websocket(self):
-        binding = self._authorize_secure_remote_dataplane()
+        timing_started_at = self._session_timing_started_at()
+        request_id = self._request_id_for_log()
+        companion_dataplane_checkpoint("encryptedWebSocketRequestEntered", request_id, timing_started_at)
+        binding = self._authorize_secure_remote_dataplane(timing_started_at=timing_started_at)
         if not binding:
             return
         if not is_websocket_upgrade(self.headers):
             self._json(400, {"error": "websocket_upgrade_required"})
             return
         session_id = parse_qs(urlparse(self.path).query).get("session_id", [""])[0]
+        companion_dataplane_checkpoint("encryptedWebSocketSessionLookupStart", request_id, timing_started_at, session=safe_fingerprint(session_id))
         if not secure_remote_dataplane_session(binding, session_id):
             self._json(403, {"error": "encrypted_session_required"})
             return
+        companion_dataplane_checkpoint("encryptedWebSocketSessionLookupComplete", request_id, timing_started_at, session=safe_fingerprint(session_id))
         upstream = urlparse(read_ha_upstream())
         upstream_host = upstream.hostname or "127.0.0.1"
         upstream_port = upstream.port or 8123
         try:
+            companion_dataplane_checkpoint("upstreamHAWebSocketConnectStart", request_id, timing_started_at, session=safe_fingerprint(session_id), host=upstream_host, port=upstream_port)
             with socket.create_connection((upstream_host, upstream_port), timeout=10) as upstream_socket:
+                companion_dataplane_checkpoint("upstreamHAWebSocketConnected", request_id, timing_started_at, session=safe_fingerprint(session_id))
                 upstream_socket.settimeout(None)
                 self.connection.settimeout(None)
+                companion_dataplane_checkpoint("upstreamHAWebSocketUpgradeRequestWriteStart", request_id, timing_started_at, session=safe_fingerprint(session_id))
                 upstream_socket.sendall(self._websocket_upgrade_request("/api/websocket", upstream_host, upstream_port))
+                companion_dataplane_checkpoint("upstreamHAWebSocketUpgradeRequestWriteComplete", request_id, timing_started_at, session=safe_fingerprint(session_id))
                 response = read_http_headers(upstream_socket)
                 if not response or not response.startswith((b"HTTP/1.1 101", b"HTTP/1.0 101")):
                     self._json(502, {"error": "websocket_upstream_rejected"})
                     return
+                companion_dataplane_checkpoint("webSocketUpgradeCompleted", request_id, timing_started_at, session=safe_fingerprint(session_id))
                 self.connection.sendall(response)
                 print(
                     f"[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionEncryptedWebSocketConnected route={safe_fingerprint(binding.get('route_id'))} encryptedDataPlane=true companionDecryption=true",
@@ -935,7 +1010,7 @@ class Handler(BaseHTTPRequestHandler):
                 websocket_started_at = time.monotonic()
                 companion_websocket_started(binding.get("route_id"), session_id)
                 try:
-                    bridge_secure_remote_dataplane_websocket(self.connection, upstream_socket, binding, session_id)
+                    bridge_secure_remote_dataplane_websocket(self.connection, upstream_socket, binding, session_id, request_id=request_id, timing_started_at=timing_started_at)
                 finally:
                     companion_websocket_completed(binding.get("route_id"), session_id, websocket_started_at)
         except Exception as error:
@@ -1544,10 +1619,14 @@ class Handler(BaseHTTPRequestHandler):
 def log_e2ee_session_timing(request_id, timing_started_at, stage, lock_wait_ms=None):
     if timing_started_at is None:
         return
+    active_http, active_websockets = companion_runtime_counts_unlocked()
     message = (
         "[SOSYNC-E2EE-SESSION-TIMING] "
         f"requestID={request_id} "
         f"stage={stage} "
+        f"thread={threading.get_ident()} "
+        f"activeHTTP={active_http} "
+        f"activeWebSockets={active_websockets} "
         f"elapsedMs={elapsed_ms_since(timing_started_at)}"
     )
     if lock_wait_ms is not None:
@@ -1902,13 +1981,21 @@ def perform_secure_remote_dataplane_rest(method, ha_path, headers, body_base64ur
         }
 
 
-def bridge_secure_remote_dataplane_websocket(client_socket, upstream_socket, binding, session_id):
+def bridge_secure_remote_dataplane_websocket(client_socket, upstream_socket, binding, session_id, request_id="unknown", timing_started_at=None):
     sockets = [client_socket, upstream_socket]
     next_revocation_check_at = 0
+    did_log_first_upstream_frame = False
+    did_log_first_encrypted_outbound = False
+    did_log_first_encrypted_outbound_write = False
+    did_log_first_client_frame = False
+    did_log_first_client_decrypt = False
+    did_log_first_upstream_auth_write = False
+    did_log_first_upstream_auth_written = False
     try:
         while True:
             now = time.monotonic()
             if now >= next_revocation_check_at:
+                note_secure_remote_binding_stat("revocationPolls")
                 revocation_started_at = time.monotonic()
                 current_binding = read_secure_remote_binding()
                 session_present = secure_remote_dataplane_session(binding, session_id, enforce_expiry=False)
@@ -1930,6 +2017,9 @@ def bridge_secure_remote_dataplane_websocket(client_socket, upstream_socket, bin
             for source in readable:
                 if source is client_socket:
                     opcode, payload = read_websocket_frame(client_socket)
+                    if not did_log_first_client_frame:
+                        did_log_first_client_frame = True
+                        companion_dataplane_checkpoint("firstEncryptedInboundClientFrameReceived", request_id, timing_started_at, session=safe_fingerprint(session_id), opcode=websocket_opcode_class(opcode), bytes=len(payload))
                     if opcode in (0x8, None):
                         return
                     if opcode == 0x9:
@@ -1941,9 +2031,21 @@ def bridge_secure_remote_dataplane_websocket(client_socket, upstream_socket, bin
                         raise ValueError(f"unsupported_client_websocket_opcode_{websocket_opcode_class(opcode)}")
                     envelope = json.loads(payload.decode("utf-8"))
                     plaintext = decrypt_secure_remote_dataplane_envelope(binding, envelope, "client_to_companion", enforce_expiry=False)
+                    if not did_log_first_client_decrypt:
+                        did_log_first_client_decrypt = True
+                        companion_dataplane_checkpoint("firstInboundFrameDecrypted", request_id, timing_started_at, session=safe_fingerprint(session_id), bytes=len(plaintext))
+                    if not did_log_first_upstream_auth_write:
+                        did_log_first_upstream_auth_write = True
+                        companion_dataplane_checkpoint("firstUpstreamHAAuthFrameWriteStart", request_id, timing_started_at, session=safe_fingerprint(session_id), bytes=len(plaintext))
                     write_websocket_frame(upstream_socket, 0x1, plaintext, mask=False)
+                    if not did_log_first_upstream_auth_written:
+                        did_log_first_upstream_auth_written = True
+                        companion_dataplane_checkpoint("firstUpstreamHAAuthFrameWritten", request_id, timing_started_at, session=safe_fingerprint(session_id), bytes=len(plaintext))
                 else:
                     opcode, payload = read_websocket_frame(upstream_socket)
+                    if not did_log_first_upstream_frame:
+                        did_log_first_upstream_frame = True
+                        companion_dataplane_checkpoint("firstUpstreamHAFrameReceived", request_id, timing_started_at, session=safe_fingerprint(session_id), opcode=websocket_opcode_class(opcode), bytes=len(payload))
                     if opcode in (0x8, None):
                         return
                     if opcode == 0x9:
@@ -1957,9 +2059,15 @@ def bridge_secure_remote_dataplane_websocket(client_socket, upstream_socket, bin
                         log_encrypted_websocket_outbound(binding, session_id, opcode, len(payload), classification="unsupportedControl")
                         raise ValueError(f"unsupported_upstream_websocket_opcode_{websocket_opcode_class(opcode)}")
                     envelope = encrypt_secure_remote_dataplane_envelope(binding, session_id, payload, "companion_to_client", f"ws-event-{uuid.uuid4()}", enforce_expiry=False)
+                    if not did_log_first_encrypted_outbound:
+                        did_log_first_encrypted_outbound = True
+                        companion_dataplane_checkpoint("firstEncryptedOutboundFrameGenerated", request_id, timing_started_at, session=safe_fingerprint(session_id), sequence=envelope.get("sequence"), plaintextBytes=len(payload))
                     envelope_bytes = json.dumps(envelope, separators=(",", ":")).encode("utf-8")
                     log_encrypted_websocket_outbound(binding, session_id, opcode, len(payload), envelope=envelope, envelope_bytes=len(envelope_bytes), classification="data")
                     write_websocket_frame(client_socket, 0x1, envelope_bytes, mask=False)
+                    if not did_log_first_encrypted_outbound_write:
+                        did_log_first_encrypted_outbound_write = True
+                        companion_dataplane_checkpoint("firstEncryptedOutboundFrameWritten", request_id, timing_started_at, session=safe_fingerprint(session_id), sequence=envelope.get("sequence"), envelopeBytes=len(envelope_bytes))
     finally:
         with timed_lock(SECURE_REMOTE_DATAPLANE_LOCK, "dataplaneSessionRemove", log_threshold_ms=10):
             SECURE_REMOTE_DATAPLANE_SESSIONS.pop((binding.get("route_id"), str(session_id or "")), None)
@@ -2671,12 +2779,15 @@ def read_json_file(path, default, cache_ttl_seconds=0):
         with timed_lock(COMPANION_CACHE_LOCK, "companionCache", log_threshold_ms=10):
             cached = COMPANION_JSON_READ_CACHE.get(path)
             if cached and cached.get("expires_at", 0) > now:
-                companion_perf_log_if_slow(
-                    "fileReadCacheHit",
-                    elapsed_ms_since(cache_started_at),
-                    threshold_ms=5,
-                    path=os.path.basename(path)
-                )
+                if path == SECURE_REMOTE_BINDING_FILE:
+                    note_secure_remote_binding_stat("cacheHits")
+                else:
+                    companion_perf_log_if_slow(
+                        "fileReadCacheHit",
+                        elapsed_ms_since(cache_started_at),
+                        threshold_ms=5,
+                        path=os.path.basename(path)
+                    )
                 return copy_json_value(cached.get("value"))
     started_at = time.monotonic()
     try:
@@ -2686,7 +2797,12 @@ def read_json_file(path, default, cache_ttl_seconds=0):
                 byte_count = os.path.getsize(path)
             except OSError:
                 byte_count = "unknown"
-            companion_perf_log("fileReadCompleted", path=os.path.basename(path), elapsedMs=elapsed_ms_since(started_at), bytes=byte_count)
+            read_elapsed_ms = elapsed_ms_since(started_at)
+            if path == SECURE_REMOTE_BINDING_FILE:
+                note_secure_remote_binding_stat("diskReads")
+                companion_perf_log_if_slow("fileReadCompleted", read_elapsed_ms, threshold_ms=25, path=os.path.basename(path), bytes=byte_count)
+            else:
+                companion_perf_log("fileReadCompleted", path=os.path.basename(path), elapsedMs=read_elapsed_ms, bytes=byte_count)
             if cache_ttl_seconds > 0:
                 with timed_lock(COMPANION_CACHE_LOCK, "companionCache", log_threshold_ms=10):
                     COMPANION_JSON_READ_CACHE[path] = {
@@ -2722,6 +2838,7 @@ def write_json_file_secure(path, payload):
 
 
 def read_secure_remote_binding():
+    note_secure_remote_binding_stat("bindingChecks")
     return read_json_file(SECURE_REMOTE_BINDING_FILE, {}, cache_ttl_seconds=0.25)
 
 
