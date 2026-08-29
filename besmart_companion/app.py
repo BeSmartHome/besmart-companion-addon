@@ -78,6 +78,7 @@ SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY = None
 SECURE_REMOTE_TUNNEL_STARTING = False
 SECURE_REMOTE_DATAPLANE_SESSIONS = {}
 SECURE_REMOTE_DATAPLANE_LOCK = threading.Lock()
+SECURE_REMOTE_DATAPLANE_REVOCATION_POLL_SECONDS = 1.0
 SECURE_REMOTE_WS_LOG_COUNTS = {}
 SECURE_REMOTE_WS_LOG_LOCK = threading.Lock()
 COMPANION_REQUEST_LOCK = threading.Lock()
@@ -1747,7 +1748,9 @@ def secure_remote_dataplane_aad(route_id, session_id, device_id, direction, sequ
 
 def decrypt_secure_remote_dataplane_envelope(binding, envelope, expected_direction, enforce_expiry=True):
     decrypt_started_at = time.monotonic()
+    session_lookup_started_at = time.monotonic()
     session = secure_remote_dataplane_session(binding, envelope.get("session_id"), enforce_expiry=enforce_expiry)
+    session_lookup_ms = elapsed_ms_since(session_lookup_started_at)
     if not session:
         raise ValueError("encrypted_session_required")
     if (
@@ -1763,28 +1766,49 @@ def decrypt_secure_remote_dataplane_envelope(binding, envelope, expected_directi
     nonce = base64url_decode(envelope.get("nonce") or "")
     ciphertext = base64url_decode(envelope.get("ciphertext") or "")
     aad = secure_remote_dataplane_aad(binding.get("route_id"), session["session_id"], session["device_id"], expected_direction, sequence, str(envelope.get("message_id") or ""))
+    crypto_core_started_at = time.monotonic()
     plaintext = ChaCha20Poly1305(session["client_key"]).decrypt(nonce, ciphertext, aad)
-    companion_perf_log_if_slow("cryptoCompleted", elapsed_ms_since(decrypt_started_at), operation="decryptEnvelope", session=safe_fingerprint(session.get("session_id")), sequence=sequence)
+    crypto_core_ms = elapsed_ms_since(crypto_core_started_at)
+    session_update_started_at = time.monotonic()
     with timed_lock(SECURE_REMOTE_DATAPLANE_LOCK, "dataplaneSessionUpdate", log_threshold_ms=10):
         session["highest_client_sequence"] = sequence
         SECURE_REMOTE_DATAPLANE_SESSIONS[(binding.get("route_id"), session["session_id"])] = session
+    session_update_ms = elapsed_ms_since(session_update_started_at)
+    companion_perf_log_if_slow(
+        "cryptoCompleted",
+        elapsed_ms_since(decrypt_started_at),
+        operation="decryptEnvelope",
+        session=safe_fingerprint(session.get("session_id")),
+        sequence=sequence,
+        sessionLookupMs=session_lookup_ms,
+        cryptoCoreMs=crypto_core_ms,
+        sessionUpdateMs=session_update_ms,
+        ciphertextBytes=len(ciphertext),
+        plaintextBytes=len(plaintext)
+    )
     return plaintext
 
 
 def encrypt_secure_remote_dataplane_envelope(binding, session_id, plaintext, direction, message_id, enforce_expiry=True):
     encrypt_started_at = time.monotonic()
+    session_lookup_started_at = time.monotonic()
     session = secure_remote_dataplane_session(binding, session_id, enforce_expiry=enforce_expiry)
+    session_lookup_ms = elapsed_ms_since(session_lookup_started_at)
     if not session:
         raise ValueError("encrypted_session_required")
     sequence = int(session.get("next_companion_sequence") or 1)
     session["next_companion_sequence"] = sequence + 1
     nonce = os.urandom(12)
     aad = secure_remote_dataplane_aad(binding.get("route_id"), session["session_id"], session["device_id"], direction, sequence, message_id)
+    crypto_core_started_at = time.monotonic()
     ciphertext = ChaCha20Poly1305(session["companion_key"]).encrypt(nonce, plaintext, aad)
-    companion_perf_log_if_slow("cryptoCompleted", elapsed_ms_since(encrypt_started_at), operation="encryptEnvelope", session=safe_fingerprint(session.get("session_id")), sequence=sequence)
+    crypto_core_ms = elapsed_ms_since(crypto_core_started_at)
+    session_update_started_at = time.monotonic()
     with timed_lock(SECURE_REMOTE_DATAPLANE_LOCK, "dataplaneSessionUpdate", log_threshold_ms=10):
         SECURE_REMOTE_DATAPLANE_SESSIONS[(binding.get("route_id"), session["session_id"])] = session
-    return {
+    session_update_ms = elapsed_ms_since(session_update_started_at)
+    envelope_started_at = time.monotonic()
+    envelope = {
         "protocol_version": 1,
         "route_id": binding.get("route_id"),
         "session_id": session["session_id"],
@@ -1795,6 +1819,21 @@ def encrypt_secure_remote_dataplane_envelope(binding, session_id, plaintext, dir
         "nonce": base64url_encode(nonce),
         "ciphertext": base64url_encode(ciphertext)
     }
+    envelope_ms = elapsed_ms_since(envelope_started_at)
+    companion_perf_log_if_slow(
+        "cryptoCompleted",
+        elapsed_ms_since(encrypt_started_at),
+        operation="encryptEnvelope",
+        session=safe_fingerprint(session.get("session_id")),
+        sequence=sequence,
+        sessionLookupMs=session_lookup_ms,
+        cryptoCoreMs=crypto_core_ms,
+        sessionUpdateMs=session_update_ms,
+        envelopeMs=envelope_ms,
+        plaintextBytes=len(plaintext),
+        ciphertextBytes=len(ciphertext)
+    )
+    return envelope
 
 
 def websocket_opcode_class(opcode):
@@ -1865,15 +1904,28 @@ def perform_secure_remote_dataplane_rest(method, ha_path, headers, body_base64ur
 
 def bridge_secure_remote_dataplane_websocket(client_socket, upstream_socket, binding, session_id):
     sockets = [client_socket, upstream_socket]
+    next_revocation_check_at = 0
     try:
         while True:
-            current_binding = read_secure_remote_binding()
-            if current_binding.get("status") == "revoked" or not secure_remote_dataplane_session(binding, session_id, enforce_expiry=False):
-                print(
-                    f"[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionEncryptedWebSocketRevocationClosed route={safe_fingerprint(binding.get('route_id'))} maxRevocationEnforcementSeconds=60",
-                    flush=True
+            now = time.monotonic()
+            if now >= next_revocation_check_at:
+                revocation_started_at = time.monotonic()
+                current_binding = read_secure_remote_binding()
+                session_present = secure_remote_dataplane_session(binding, session_id, enforce_expiry=False)
+                companion_perf_log_if_slow(
+                    "webSocketRevocationPollCompleted",
+                    elapsed_ms_since(revocation_started_at),
+                    threshold_ms=10,
+                    route=safe_fingerprint(binding.get("route_id")),
+                    session=safe_fingerprint(session_id)
                 )
-                return
+                next_revocation_check_at = now + SECURE_REMOTE_DATAPLANE_REVOCATION_POLL_SECONDS
+                if current_binding.get("status") == "revoked" or not session_present:
+                    print(
+                        f"[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionEncryptedWebSocketRevocationClosed route={safe_fingerprint(binding.get('route_id'))} maxRevocationEnforcementSeconds=60",
+                        flush=True
+                    )
+                    return
             readable, _, _ = select.select(sockets, [], [], 0.5)
             for source in readable:
                 if source is client_socket:
@@ -2615,10 +2667,16 @@ def envelope_canonical_payload(envelope):
 def read_json_file(path, default, cache_ttl_seconds=0):
     now = time.monotonic()
     if cache_ttl_seconds > 0:
+        cache_started_at = time.monotonic()
         with timed_lock(COMPANION_CACHE_LOCK, "companionCache", log_threshold_ms=10):
             cached = COMPANION_JSON_READ_CACHE.get(path)
             if cached and cached.get("expires_at", 0) > now:
-                companion_perf_log("fileReadCacheHit", path=os.path.basename(path))
+                companion_perf_log_if_slow(
+                    "fileReadCacheHit",
+                    elapsed_ms_since(cache_started_at),
+                    threshold_ms=5,
+                    path=os.path.basename(path)
+                )
                 return copy_json_value(cached.get("value"))
     started_at = time.monotonic()
     try:
