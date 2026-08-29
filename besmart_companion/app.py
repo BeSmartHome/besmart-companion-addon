@@ -16,6 +16,7 @@ import traceback
 import uuid
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlparse
 
@@ -74,15 +75,26 @@ SECURE_REMOTE_CONNECTOR_CONFIRMATION_SECONDS = float(os.environ.get("SOSYNC_CONN
 SECURE_REMOTE_TUNNEL_LOCK = threading.Lock()
 SECURE_REMOTE_TUNNEL_PROCESS = None
 SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY = None
+SECURE_REMOTE_TUNNEL_STARTING = False
 SECURE_REMOTE_DATAPLANE_SESSIONS = {}
 SECURE_REMOTE_DATAPLANE_LOCK = threading.Lock()
+SECURE_REMOTE_WS_LOG_COUNTS = {}
+SECURE_REMOTE_WS_LOG_LOCK = threading.Lock()
 COMPANION_REQUEST_LOCK = threading.Lock()
 COMPANION_JSON_WRITE_LOCK = threading.Lock()
 COMPANION_IDENTITY_LOCK = threading.Lock()
 E2EE_IDENTITY_LOCK = threading.Lock()
+COMPANION_CACHE_LOCK = threading.Lock()
 COMPANION_ACTIVE_HTTP_REQUESTS = 0
 COMPANION_ACTIVE_WEBSOCKETS = 0
 COMPANION_REQUEST_SEQUENCE = 0
+COMPANION_IDENTITY_CACHE = None
+E2EE_IDENTITY_CACHE = None
+COMPANION_JSON_READ_CACHE = {}
+CLOUDFLARED_RUNTIME_STATUS_CACHE = None
+CLOUDFLARED_RUNTIME_STATUS_CACHE_EXPIRES_AT = 0
+SECURE_REMOTE_CONNECTOR_STATUS_CACHE = None
+SECURE_REMOTE_CONNECTOR_STATUS_CACHE_EXPIRES_AT = 0
 print(
     f"[SOSYNC-E2EE-COMPANION] runtimeGlobalsInitialized runtimeInstance={RUNTIME_INSTANCE_ID} build={SOSYNC_COMPANION_BUILD}",
     flush=True
@@ -184,6 +196,54 @@ def elapsed_ms_since(started_at):
     return int((time.monotonic() - started_at) * 1000)
 
 
+def companion_runtime_counts_unlocked():
+    return COMPANION_ACTIVE_HTTP_REQUESTS, COMPANION_ACTIVE_WEBSOCKETS
+
+
+def companion_perf_log(event, **fields):
+    active_http, active_websockets = companion_runtime_counts_unlocked()
+    parts = [
+        "[SOSYNC-COMPANION-PERF]",
+        f"event={event}",
+        f"thread={threading.get_ident()}",
+        f"activeHTTP={active_http}",
+        f"activeWebSockets={active_websockets}",
+    ]
+    for key, value in fields.items():
+        parts.append(f"{key}={value}")
+    print(" ".join(parts), flush=True)
+
+
+def companion_perf_log_if_slow(event, elapsed_ms, threshold_ms=25, **fields):
+    if elapsed_ms >= threshold_ms:
+        companion_perf_log(event, elapsedMs=elapsed_ms, **fields)
+
+
+@contextmanager
+def timed_lock(lock, name, request_id="none", log_threshold_ms=5):
+    wait_started_at = time.monotonic()
+    lock.acquire()
+    acquired_at = time.monotonic()
+    wait_ms = elapsed_ms_since(wait_started_at)
+    if wait_ms >= log_threshold_ms:
+        companion_perf_log("lockWaitCompleted", lock=name, requestID=request_id, waitMs=wait_ms)
+    try:
+        yield
+    finally:
+        hold_ms = elapsed_ms_since(acquired_at)
+        lock.release()
+        if hold_ms >= log_threshold_ms:
+            companion_perf_log("lockHoldCompleted", lock=name, requestID=request_id, holdMs=hold_ms)
+
+
+def copy_json_value(value):
+    if isinstance(value, dict):
+        return {key: copy_json_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [copy_json_value(item) for item in value]
+    return value
+
+
 class Handler(BaseHTTPRequestHandler):
     def parse_request(self):
         parsed = super().parse_request()
@@ -213,10 +273,18 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, status, payload, headers=None):
         should_log_session_send = companion_path_class(getattr(self, "path", "")) == "secureRemoteEncryptedSession"
         timing_started_at = self._session_timing_started_at() if should_log_session_send else None
+        serialization_started_at = time.monotonic()
         if should_log_session_send:
             self._log_e2ee_session_timing("sendJSONStarted", timing_started_at)
             self._log_e2ee_session_timing("sendJSONBodySerializationStarted", timing_started_at)
         body = json.dumps(payload).encode("utf-8")
+        companion_perf_log_if_slow(
+            "jsonResponseSerialized",
+            elapsed_ms_since(serialization_started_at),
+            requestID=self._request_id_for_log(),
+            pathClass=companion_path_class(getattr(self, "path", "")),
+            bytes=len(body)
+        )
         if should_log_session_send:
             self._log_e2ee_session_timing("sendJSONBodySerializationCompleted", timing_started_at)
         try:
@@ -229,11 +297,25 @@ class Handler(BaseHTTPRequestHandler):
             if should_log_session_send:
                 self._log_e2ee_session_timing("headersWritten", timing_started_at)
                 self._log_e2ee_session_timing("bodyWriteStarted", timing_started_at)
+            write_started_at = time.monotonic()
             self.wfile.write(body)
+            companion_perf_log_if_slow(
+                "jsonResponseWrite",
+                elapsed_ms_since(write_started_at),
+                requestID=self._request_id_for_log(),
+                pathClass=companion_path_class(getattr(self, "path", "")),
+                bytes=len(body)
+            )
             if should_log_session_send:
                 self._log_e2ee_session_timing("bodyWriteCompleted", timing_started_at)
                 self._log_e2ee_session_timing("sendJSONCompleted", timing_started_at)
-        except BrokenPipeError:
+        except (BrokenPipeError, ConnectionResetError) as error:
+            companion_perf_log(
+                "jsonResponseWriteFailed",
+                requestID=self._request_id_for_log(),
+                pathClass=companion_path_class(getattr(self, "path", "")),
+                error=type(error).__name__
+            )
             if should_log_session_send:
                 self._log_e2ee_session_timing("sendJSONFailedBrokenPipe", timing_started_at)
             print(f"Client disconnected before JSON response status={status}", flush=True)
@@ -298,7 +380,19 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/identity":
+            identity_started_at = time.monotonic()
             identity = ensure_companion_identity()
+            server_id = get_or_create_server_id()
+            remote_url = read_remote_url()
+            runtime = cloudflared_runtime_status()
+            secure_remote_status = secure_remote_public_status()
+            companion_perf_log(
+                "handlerCheckpoint",
+                requestID=self._request_id_for_log(),
+                pathClass="identity",
+                stage="dependenciesLoaded",
+                elapsedMs=elapsed_ms_since(identity_started_at)
+            )
             self._json(200, {
                 "protocol_version": 1,
                 "companion_version": SOSYNC_COMPANION_VERSION,
@@ -312,13 +406,13 @@ class Handler(BaseHTTPRequestHandler):
                 "runtime_instance_id": RUNTIME_INSTANCE_ID,
                 "runtime_started_at": RUNTIME_STARTED_AT,
                 "build": SOSYNC_COMPANION_BUILD,
-                "server_id": get_or_create_server_id(),
-                "remote_url": read_remote_url(),
+                "server_id": server_id,
+                "remote_url": remote_url,
                 "tailscale_dns_name": None,
-                "cloudflared_available": cloudflared_runtime_status()["available"],
-                "cloudflared_version": cloudflared_runtime_status()["version"],
-                "tunnel_state": secure_remote_public_status()["tunnel_state"],
-                "cloudflared_running": secure_remote_public_status()["cloudflared_running"]
+                "cloudflared_available": runtime["available"],
+                "cloudflared_version": runtime["version"],
+                "tunnel_state": secure_remote_status["tunnel_state"],
+                "cloudflared_running": secure_remote_status["cloudflared_running"]
             })
             return
 
@@ -534,9 +628,19 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_secure_remote_identity(self):
         if not self._authorize_secure_remote_control_plane():
             return
+        started_at = time.monotonic()
         identity = ensure_e2ee_identity()
         companion_identity = ensure_companion_identity()
         binding = read_secure_remote_binding()
+        runtime = cloudflared_runtime_status()
+        secure_status = secure_remote_public_status(binding)
+        companion_perf_log(
+            "handlerCheckpoint",
+            requestID=self._request_id_for_log(),
+            pathClass="secureRemoteIdentity",
+            stage="dependenciesLoaded",
+            elapsedMs=elapsed_ms_since(started_at)
+        )
         self._json(200, {
             "protocol_version": 1,
             "companion_version": SOSYNC_COMPANION_VERSION,
@@ -548,10 +652,10 @@ class Handler(BaseHTTPRequestHandler):
             "companion_public_key_fingerprint": safe_fingerprint(identity["public_key"]),
             "key_version": identity["key_version"],
             "secure_remote_configured": bool(binding.get("route_id")),
-            "cloudflared_available": cloudflared_runtime_status()["available"],
-            "cloudflared_version": cloudflared_runtime_status()["version"],
-            "tunnel_state": secure_remote_public_status(binding)["tunnel_state"],
-            "cloudflared_running": secure_remote_public_status(binding)["cloudflared_running"]
+            "cloudflared_available": runtime["available"],
+            "cloudflared_version": runtime["version"],
+            "tunnel_state": secure_status["tunnel_state"],
+            "cloudflared_running": secure_status["cloudflared_running"]
         })
 
     def _handle_secure_remote_status(self):
@@ -1401,9 +1505,26 @@ class Handler(BaseHTTPRequestHandler):
         if length > max_bytes:
             raise ValueError("payload_too_large")
 
+        read_started_at = time.monotonic()
         body = self.rfile.read(length) if length > 0 else b"{}"
+        companion_perf_log_if_slow(
+            "requestBodyRead",
+            elapsed_ms_since(read_started_at),
+            requestID=self._request_id_for_log(),
+            pathClass=companion_path_class(getattr(self, "path", "")),
+            bytes=len(body)
+        )
+        parse_started_at = time.monotonic()
         try:
-            return json.loads(body.decode("utf-8") or "{}")
+            value = json.loads(body.decode("utf-8") or "{}")
+            companion_perf_log_if_slow(
+                "requestJSONParsed",
+                elapsed_ms_since(parse_started_at),
+                requestID=self._request_id_for_log(),
+                pathClass=companion_path_class(getattr(self, "path", "")),
+                bytes=len(body)
+            )
+            return value
         except json.JSONDecodeError:
             raise ValueError("invalid_json")
 
@@ -1543,6 +1664,7 @@ def create_secure_remote_dataplane_session(binding, request, request_id="unknown
         raise ValueError("pairing_mismatch")
 
     log_e2ee_session_timing(request_id, timing_started_at, "cryptoKeyDerivationStarted")
+    crypto_started_at = time.monotonic()
     companion_ephemeral = x25519.X25519PrivateKey.generate()
     companion_ephemeral_public_key = base64url_encode(companion_ephemeral.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw))
     shared = x25519.X25519PrivateKey.from_private_bytes(base64url_decode(identity["private_key"])).exchange(
@@ -1559,6 +1681,7 @@ def create_secure_remote_dataplane_session(binding, request, request_id="unknown
         companion_ephemeral_public_key
     )
     log_e2ee_session_timing(request_id, timing_started_at, "cryptoKeyDerivationCompleted")
+    companion_perf_log("cryptoCompleted", operation="sessionKeyDerivation", requestID=request_id, elapsedMs=elapsed_ms_since(crypto_started_at))
     log_e2ee_session_timing(request_id, timing_started_at, "sessionObjectCreationStarted")
     session = {
         "session_id": session_id,
@@ -1576,7 +1699,7 @@ def create_secure_remote_dataplane_session(binding, request, request_id="unknown
     log_e2ee_session_timing(request_id, timing_started_at, "sessionObjectCreationCompleted")
     lock_started_at = time.monotonic()
     log_e2ee_session_timing(request_id, timing_started_at, "dataplaneSessionLockWaitStarted")
-    with SECURE_REMOTE_DATAPLANE_LOCK:
+    with timed_lock(SECURE_REMOTE_DATAPLANE_LOCK, "dataplaneSessionStore", request_id=request_id, log_threshold_ms=1):
         lock_wait_ms = elapsed_ms_since(lock_started_at)
         log_e2ee_session_timing(request_id, timing_started_at, "dataplaneSessionLockAcquired", lock_wait_ms=lock_wait_ms)
         log_e2ee_session_timing(request_id, timing_started_at, "dataplaneSessionStoreStarted")
@@ -1587,7 +1710,7 @@ def create_secure_remote_dataplane_session(binding, request, request_id="unknown
 
 def secure_remote_dataplane_session(binding, session_id, enforce_expiry=True):
     key = (binding.get("route_id"), str(session_id or ""))
-    with SECURE_REMOTE_DATAPLANE_LOCK:
+    with timed_lock(SECURE_REMOTE_DATAPLANE_LOCK, "dataplaneSessionLookup", log_threshold_ms=10):
         session = SECURE_REMOTE_DATAPLANE_SESSIONS.get(key)
         if not session or (enforce_expiry and session.get("expires_at", 0) < time.time()):
             SECURE_REMOTE_DATAPLANE_SESSIONS.pop(key, None)
@@ -1623,6 +1746,7 @@ def secure_remote_dataplane_aad(route_id, session_id, device_id, direction, sequ
 
 
 def decrypt_secure_remote_dataplane_envelope(binding, envelope, expected_direction, enforce_expiry=True):
+    decrypt_started_at = time.monotonic()
     session = secure_remote_dataplane_session(binding, envelope.get("session_id"), enforce_expiry=enforce_expiry)
     if not session:
         raise ValueError("encrypted_session_required")
@@ -1640,13 +1764,15 @@ def decrypt_secure_remote_dataplane_envelope(binding, envelope, expected_directi
     ciphertext = base64url_decode(envelope.get("ciphertext") or "")
     aad = secure_remote_dataplane_aad(binding.get("route_id"), session["session_id"], session["device_id"], expected_direction, sequence, str(envelope.get("message_id") or ""))
     plaintext = ChaCha20Poly1305(session["client_key"]).decrypt(nonce, ciphertext, aad)
-    with SECURE_REMOTE_DATAPLANE_LOCK:
+    companion_perf_log_if_slow("cryptoCompleted", elapsed_ms_since(decrypt_started_at), operation="decryptEnvelope", session=safe_fingerprint(session.get("session_id")), sequence=sequence)
+    with timed_lock(SECURE_REMOTE_DATAPLANE_LOCK, "dataplaneSessionUpdate", log_threshold_ms=10):
         session["highest_client_sequence"] = sequence
         SECURE_REMOTE_DATAPLANE_SESSIONS[(binding.get("route_id"), session["session_id"])] = session
     return plaintext
 
 
 def encrypt_secure_remote_dataplane_envelope(binding, session_id, plaintext, direction, message_id, enforce_expiry=True):
+    encrypt_started_at = time.monotonic()
     session = secure_remote_dataplane_session(binding, session_id, enforce_expiry=enforce_expiry)
     if not session:
         raise ValueError("encrypted_session_required")
@@ -1655,7 +1781,8 @@ def encrypt_secure_remote_dataplane_envelope(binding, session_id, plaintext, dir
     nonce = os.urandom(12)
     aad = secure_remote_dataplane_aad(binding.get("route_id"), session["session_id"], session["device_id"], direction, sequence, message_id)
     ciphertext = ChaCha20Poly1305(session["companion_key"]).encrypt(nonce, plaintext, aad)
-    with SECURE_REMOTE_DATAPLANE_LOCK:
+    companion_perf_log_if_slow("cryptoCompleted", elapsed_ms_since(encrypt_started_at), operation="encryptEnvelope", session=safe_fingerprint(session.get("session_id")), sequence=sequence)
+    with timed_lock(SECURE_REMOTE_DATAPLANE_LOCK, "dataplaneSessionUpdate", log_threshold_ms=10):
         SECURE_REMOTE_DATAPLANE_SESSIONS[(binding.get("route_id"), session["session_id"])] = session
     return {
         "protocol_version": 1,
@@ -1691,12 +1818,21 @@ def websocket_opcode_class(opcode):
 def log_encrypted_websocket_outbound(binding, session_id, opcode, plaintext_bytes, envelope=None, envelope_bytes=0, classification="data"):
     sequence = envelope.get("sequence") if isinstance(envelope, dict) else "none"
     envelope_version = envelope.get("protocol_version") if isinstance(envelope, dict) else "none"
+    route_fingerprint = safe_fingerprint(binding.get("route_id"))
+    session_fingerprint = safe_fingerprint(session_id)
+    with timed_lock(SECURE_REMOTE_WS_LOG_LOCK, "webSocketLog", log_threshold_ms=10):
+        counter_key = (route_fingerprint, session_fingerprint, classification)
+        count = SECURE_REMOTE_WS_LOG_COUNTS.get(counter_key, 0) + 1
+        SECURE_REMOTE_WS_LOG_COUNTS[counter_key] = count
+    should_log = classification != "data" or count <= 3 or count % 50 == 0
+    if not should_log:
+        return
     print(
         "[SOSYNC-SECURE-REMOTE-DATAPLANE] "
         f"event=encryptedWebSocketOutbound messageType={websocket_opcode_class(opcode)} "
-        f"envelopeVersion={envelope_version} session={safe_fingerprint(session_id)} "
+        f"envelopeVersion={envelope_version} session={session_fingerprint} "
         f"sequence={sequence} plaintextBytes={plaintext_bytes} envelopeBytes={envelope_bytes} "
-        f"classification={classification}",
+        f"classification={classification} sampleCount={count}",
         flush=True
     )
 
@@ -1773,11 +1909,18 @@ def bridge_secure_remote_dataplane_websocket(client_socket, upstream_socket, bin
                     log_encrypted_websocket_outbound(binding, session_id, opcode, len(payload), envelope=envelope, envelope_bytes=len(envelope_bytes), classification="data")
                     write_websocket_frame(client_socket, 0x1, envelope_bytes, mask=False)
     finally:
-        with SECURE_REMOTE_DATAPLANE_LOCK:
+        with timed_lock(SECURE_REMOTE_DATAPLANE_LOCK, "dataplaneSessionRemove", log_threshold_ms=10):
             SECURE_REMOTE_DATAPLANE_SESSIONS.pop((binding.get("route_id"), str(session_id or "")), None)
+        route_fingerprint = safe_fingerprint(binding.get("route_id"))
+        session_fingerprint = safe_fingerprint(session_id)
+        with timed_lock(SECURE_REMOTE_WS_LOG_LOCK, "webSocketLog", log_threshold_ms=10):
+            for key in list(SECURE_REMOTE_WS_LOG_COUNTS.keys()):
+                if key[0] == route_fingerprint and key[1] == session_fingerprint:
+                    SECURE_REMOTE_WS_LOG_COUNTS.pop(key, None)
 
 
 def read_websocket_frame(sock):
+    started_at = time.monotonic()
     header = recv_exact(sock, 2)
     if not header:
         return None, b""
@@ -1792,10 +1935,17 @@ def read_websocket_frame(sock):
     payload = recv_exact(sock, length) if length else b""
     if masked:
         payload = bytes(byte ^ mask_key[index % 4] for index, byte in enumerate(payload))
+    companion_perf_log_if_slow(
+        "webSocketFrameRead",
+        elapsed_ms_since(started_at),
+        opcode=websocket_opcode_class(opcode),
+        bytes=len(payload)
+    )
     return opcode, payload
 
 
 def write_websocket_frame(sock, opcode, payload, mask=False):
+    started_at = time.monotonic()
     first = 0x80 | (opcode & 0x0F)
     length = len(payload)
     if length < 126:
@@ -1809,6 +1959,12 @@ def write_websocket_frame(sock, opcode, payload, mask=False):
         payload = bytes(byte ^ mask_key[index % 4] for index, byte in enumerate(payload))
         header += mask_key
     sock.sendall(header + payload)
+    companion_perf_log_if_slow(
+        "webSocketFrameWrite",
+        elapsed_ms_since(started_at),
+        opcode=websocket_opcode_class(opcode),
+        bytes=len(payload)
+    )
 
 
 def recv_exact(sock, length):
@@ -2034,7 +2190,12 @@ def read_remote_token():
 
 
 def ensure_companion_identity():
-    with COMPANION_IDENTITY_LOCK:
+    global COMPANION_IDENTITY_CACHE
+    if isinstance(COMPANION_IDENTITY_CACHE, dict):
+        return copy_json_value(COMPANION_IDENTITY_CACHE)
+    with timed_lock(COMPANION_IDENTITY_LOCK, "companionIdentity", log_threshold_ms=5):
+        if isinstance(COMPANION_IDENTITY_CACHE, dict):
+            return copy_json_value(COMPANION_IDENTITY_CACHE)
         identity = read_json_file(COMPANION_IDENTITY_FILE, None)
         if (
             isinstance(identity, dict) and
@@ -2045,7 +2206,8 @@ def ensure_companion_identity():
             identity.get("encryption_public_key") and
             identity.get("encryption_private_key")
         ):
-            return identity
+            COMPANION_IDENTITY_CACHE = copy_json_value(identity)
+            return copy_json_value(identity)
 
         signing_private_key = ed25519.Ed25519PrivateKey.generate()
         signing_public_key = signing_private_key.public_key()
@@ -2065,14 +2227,20 @@ def ensure_companion_identity():
             "created_at": iso_now()
         }
         write_json_file_secure(COMPANION_IDENTITY_FILE, identity)
-        return identity
+        COMPANION_IDENTITY_CACHE = copy_json_value(identity)
+        return copy_json_value(identity)
 
 
 def ensure_e2ee_identity(request_id=None, timing_started_at=None):
+    global E2EE_IDENTITY_CACHE
+    if isinstance(E2EE_IDENTITY_CACHE, dict):
+        return copy_json_value(E2EE_IDENTITY_CACHE)
     lock_started_at = time.monotonic() if timing_started_at is not None else None
     if timing_started_at is not None:
         log_e2ee_session_timing(request_id or "unknown", timing_started_at, "identityLockWaitStarted")
-    with E2EE_IDENTITY_LOCK:
+    with timed_lock(E2EE_IDENTITY_LOCK, "e2eeIdentity", request_id=request_id or "none", log_threshold_ms=5):
+        if isinstance(E2EE_IDENTITY_CACHE, dict):
+            return copy_json_value(E2EE_IDENTITY_CACHE)
         if timing_started_at is not None and lock_started_at is not None:
             log_e2ee_session_timing(
                 request_id or "unknown",
@@ -2091,7 +2259,8 @@ def ensure_e2ee_identity(request_id=None, timing_started_at=None):
             identity.get("private_key") and
             identity.get("key_version")
         ):
-            return identity
+            E2EE_IDENTITY_CACHE = copy_json_value(identity)
+            return copy_json_value(identity)
 
         private_key = x25519.X25519PrivateKey.generate()
         public_key = private_key.public_key()
@@ -2108,11 +2277,12 @@ def ensure_e2ee_identity(request_id=None, timing_started_at=None):
         write_json_file_secure(E2EE_IDENTITY_FILE, identity)
         if timing_started_at is not None:
             log_e2ee_session_timing(request_id or "unknown", timing_started_at, "identityFileWriteCompleted")
-        return identity
+        E2EE_IDENTITY_CACHE = copy_json_value(identity)
+        return copy_json_value(identity)
 
 
 def read_e2ee_pairings():
-    pairings = read_json_file(E2EE_PAIRINGS_FILE, {"devices": {}})
+    pairings = read_json_file(E2EE_PAIRINGS_FILE, {"devices": {}}, cache_ttl_seconds=0.25)
     if not isinstance(pairings, dict):
         return {"devices": {}}
     if not isinstance(pairings.get("devices"), dict):
@@ -2442,18 +2612,40 @@ def envelope_canonical_payload(envelope):
     return {key: value for key, value in envelope.items() if key != "backend_signature"}
 
 
-def read_json_file(path, default):
+def read_json_file(path, default, cache_ttl_seconds=0):
+    now = time.monotonic()
+    if cache_ttl_seconds > 0:
+        with timed_lock(COMPANION_CACHE_LOCK, "companionCache", log_threshold_ms=10):
+            cached = COMPANION_JSON_READ_CACHE.get(path)
+            if cached and cached.get("expires_at", 0) > now:
+                companion_perf_log("fileReadCacheHit", path=os.path.basename(path))
+                return copy_json_value(cached.get("value"))
+    started_at = time.monotonic()
     try:
         with open(path, "r", encoding="utf-8") as file:
-            return json.load(file)
+            value = json.load(file)
+            try:
+                byte_count = os.path.getsize(path)
+            except OSError:
+                byte_count = "unknown"
+            companion_perf_log("fileReadCompleted", path=os.path.basename(path), elapsedMs=elapsed_ms_since(started_at), bytes=byte_count)
+            if cache_ttl_seconds > 0:
+                with timed_lock(COMPANION_CACHE_LOCK, "companionCache", log_threshold_ms=10):
+                    COMPANION_JSON_READ_CACHE[path] = {
+                        "expires_at": time.monotonic() + cache_ttl_seconds,
+                        "value": copy_json_value(value)
+                    }
+            return value
     except (FileNotFoundError, json.JSONDecodeError):
+        companion_perf_log("fileReadDefaulted", path=os.path.basename(path), elapsedMs=elapsed_ms_since(started_at))
         return default
 
 
 def write_json_file_secure(path, payload):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     temporary_file = f"{path}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
-    with COMPANION_JSON_WRITE_LOCK:
+    started_at = time.monotonic()
+    with timed_lock(COMPANION_JSON_WRITE_LOCK, "jsonWrite", log_threshold_ms=5):
         try:
             with open(temporary_file, "w", encoding="utf-8") as file:
                 json.dump(payload, file, separators=(",", ":"))
@@ -2466,10 +2658,13 @@ def write_json_file_secure(path, payload):
                     os.remove(temporary_file)
             except OSError:
                 pass
+    with timed_lock(COMPANION_CACHE_LOCK, "companionCache", log_threshold_ms=10):
+        COMPANION_JSON_READ_CACHE.pop(path, None)
+    companion_perf_log("fileWriteCompleted", path=os.path.basename(path), elapsedMs=elapsed_ms_since(started_at))
 
 
 def read_secure_remote_binding():
-    return read_json_file(SECURE_REMOTE_BINDING_FILE, {})
+    return read_json_file(SECURE_REMOTE_BINDING_FILE, {}, cache_ttl_seconds=0.25)
 
 
 def is_opaque_secure_remote_id(value, prefix=None):
@@ -2677,6 +2872,8 @@ def secure_remote_public_status(binding=None):
 
 
 def secure_remote_connector_runtime_status(cloudflared_running):
+    global SECURE_REMOTE_CONNECTOR_STATUS_CACHE
+    global SECURE_REMOTE_CONNECTOR_STATUS_CACHE_EXPIRES_AT
     if not cloudflared_running:
         return {
             "connector_state": "notRunning",
@@ -2684,6 +2881,11 @@ def secure_remote_connector_runtime_status(cloudflared_running):
             "connector_connection_count": 0,
             "last_error_class": "processNotRunning"
         }
+    now = time.monotonic()
+    if SECURE_REMOTE_CONNECTOR_STATUS_CACHE and SECURE_REMOTE_CONNECTOR_STATUS_CACHE_EXPIRES_AT > now:
+        companion_perf_log("connectorStatusCacheHit")
+        return dict(SECURE_REMOTE_CONNECTOR_STATUS_CACHE)
+    started_at = time.monotonic()
     excerpt = read_secure_remote_tunnel_stderr_excerpt(limit=4096)
     lower = excerpt.lower()
     connected_patterns = [
@@ -2712,12 +2914,16 @@ def secure_remote_connector_runtime_status(cloudflared_running):
         error_class = "connectorDisconnected"
     else:
         error_class = "none"
-    return {
+    status = {
         "connector_state": "connected" if has_connected else "starting",
         "connector_healthy": has_connected,
         "connector_connection_count": connection_count,
         "last_error_class": error_class
     }
+    SECURE_REMOTE_CONNECTOR_STATUS_CACHE = dict(status)
+    SECURE_REMOTE_CONNECTOR_STATUS_CACHE_EXPIRES_AT = time.monotonic() + 0.25
+    companion_perf_log("connectorStatusComputed", elapsedMs=elapsed_ms_since(started_at), healthy=status["connector_healthy"])
+    return status
 
 
 def wait_for_secure_remote_connector_health(deadline, process_locked=False):
@@ -2764,35 +2970,58 @@ def secure_remote_current_process_connector_identity(cloudflared_running):
 
 
 def cloudflared_runtime_status():
+    global CLOUDFLARED_RUNTIME_STATUS_CACHE
+    global CLOUDFLARED_RUNTIME_STATUS_CACHE_EXPIRES_AT
+    now = time.monotonic()
+    if CLOUDFLARED_RUNTIME_STATUS_CACHE and CLOUDFLARED_RUNTIME_STATUS_CACHE_EXPIRES_AT > now:
+        companion_perf_log("cloudflaredRuntimeCacheHit")
+        return dict(CLOUDFLARED_RUNTIME_STATUS_CACHE)
+    started_at = time.monotonic()
     cloudflared_binary = os.environ.get("BESMART_CLOUDFLARED_BIN", "cloudflared")
     resolved = shutil.which(cloudflared_binary)
     if not resolved:
-        return {"available": False, "path": None, "version": None}
+        status = {"available": False, "path": None, "version": None}
+        CLOUDFLARED_RUNTIME_STATUS_CACHE = dict(status)
+        CLOUDFLARED_RUNTIME_STATUS_CACHE_EXPIRES_AT = time.monotonic() + 10
+        companion_perf_log("cloudflaredRuntimeComputed", elapsedMs=elapsed_ms_since(started_at), available=False)
+        return status
     version = None
     try:
+        subprocess_started_at = time.monotonic()
         result = subprocess.run([resolved, "--version"], capture_output=True, text=True, timeout=3)
+        companion_perf_log("subprocessCompleted", command="cloudflaredVersion", elapsedMs=elapsed_ms_since(subprocess_started_at))
         if result.returncode == 0:
             version = re.sub(r"\s+", " ", result.stdout.strip())[:160]
     except Exception:
         version = None
-    return {"available": True, "path": resolved, "version": version}
+    status = {"available": True, "path": resolved, "version": version}
+    CLOUDFLARED_RUNTIME_STATUS_CACHE = dict(status)
+    CLOUDFLARED_RUNTIME_STATUS_CACHE_EXPIRES_AT = time.monotonic() + 60
+    companion_perf_log("cloudflaredRuntimeComputed", elapsedMs=elapsed_ms_since(started_at), available=True)
+    return status
 
 
 def write_secure_text_file(path, value):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     temporary_file = f"{path}.tmp"
+    started_at = time.monotonic()
     with open(temporary_file, "w", encoding="utf-8") as file:
         file.write(value)
     os.chmod(temporary_file, 0o600)
     os.replace(temporary_file, path)
     os.chmod(path, 0o600)
+    companion_perf_log("fileWriteCompleted", path=os.path.basename(path), elapsedMs=elapsed_ms_since(started_at))
 
 
 def read_secure_text_file(path):
+    started_at = time.monotonic()
     try:
         with open(path, "r", encoding="utf-8") as file:
-            return file.read().strip()
+            value = file.read().strip()
+            companion_perf_log("fileReadCompleted", path=os.path.basename(path), elapsedMs=elapsed_ms_since(started_at), bytes=len(value))
+            return value
     except OSError:
+        companion_perf_log("fileReadDefaulted", path=os.path.basename(path), elapsedMs=elapsed_ms_since(started_at))
         return ""
 
 
@@ -2815,13 +3044,17 @@ def secure_remote_tunnel_stderr_file():
 
 def read_secure_remote_tunnel_stderr_excerpt(limit=1024):
     path = secure_remote_tunnel_stderr_file()
+    started_at = time.monotonic()
     try:
         with open(path, "rb") as file:
             file.seek(0, os.SEEK_END)
             size = file.tell()
             file.seek(max(0, size - limit), os.SEEK_SET)
-            return file.read(limit).decode("utf-8", errors="replace")
+            value = file.read(limit).decode("utf-8", errors="replace")
+            companion_perf_log_if_slow("fileReadCompleted", elapsed_ms_since(started_at), path=os.path.basename(path), bytes=len(value))
+            return value
     except OSError:
+        companion_perf_log_if_slow("fileReadDefaulted", elapsed_ms_since(started_at), path=os.path.basename(path))
         return ""
 
 
@@ -2842,13 +3075,14 @@ def sanitized_secure_remote_tunnel_stderr(value, token):
 
 def is_secure_remote_tunnel_running():
     global SECURE_REMOTE_TUNNEL_PROCESS
-    with SECURE_REMOTE_TUNNEL_LOCK:
+    with timed_lock(SECURE_REMOTE_TUNNEL_LOCK, "secureRemoteTunnel", log_threshold_ms=5):
         return SECURE_REMOTE_TUNNEL_PROCESS is not None and SECURE_REMOTE_TUNNEL_PROCESS.poll() is None
 
 
 def start_secure_remote_tunnel(binding=None):
     global SECURE_REMOTE_TUNNEL_PROCESS
     global SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY
+    global SECURE_REMOTE_TUNNEL_STARTING
     binding = binding if isinstance(binding, dict) else read_secure_remote_binding()
     token = read_secure_text_file(secure_remote_tunnel_token_file())
     if not token or not binding.get("route_id") or binding.get("status") == "revoked":
@@ -2857,112 +3091,136 @@ def start_secure_remote_tunnel(binding=None):
             flush=True
         )
         return {"running": False, "stage": "credential", "reason": "missingCredentialOrRoute"}
-    with SECURE_REMOTE_TUNNEL_LOCK:
+    with timed_lock(SECURE_REMOTE_TUNNEL_LOCK, "secureRemoteTunnel", log_threshold_ms=5):
         if SECURE_REMOTE_TUNNEL_PROCESS is not None and SECURE_REMOTE_TUNNEL_PROCESS.poll() is None:
             process_identity = SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY or {"available": False, "failure": "identityNotCaptured", "cloudflare_connector_tunnel_id_hash": "none"}
-            connector_status = secure_remote_connector_runtime_status(True)
+            reused_running = True
+        elif SECURE_REMOTE_TUNNEL_STARTING:
+            companion_perf_log("tunnelStartJoined", route=safe_fingerprint(binding.get("route_id")))
+            return {"running": False, "stage": "starting", "reason": "startInProgress"}
+        else:
+            SECURE_REMOTE_TUNNEL_STARTING = True
+            process_identity = None
+            reused_running = False
+    if reused_running:
+        connector_status = secure_remote_connector_runtime_status(True)
+        print(
+            f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelProcessConfirmed route={safe_fingerprint(binding.get('route_id'))} running=true reused=true connectorState={connector_status['connector_state']} connectorHealthy={connector_status['connector_healthy']} connectorConnectionCount={connector_status['connector_connection_count']} lastErrorClass={connector_status['last_error_class']}",
+            flush=True
+        )
+        print(
+            f"[SOSYNC-SECURE-REMOTE-IDENTITY] cloudflareConnectorTunnelIDHash={process_identity.get('cloudflare_connector_tunnel_id_hash')} connectorTunnelIdentityAvailable={str(bool(process_identity.get('available'))).lower()} connectorTunnelIdentityFailure={process_identity.get('failure') or 'none'} connectorTokenFormat={process_identity.get('connector_token_format') or 'unknown'} tunnelManagementMode=remoteManaged effectiveIngressSource=cloudflareApi cloudflaredRunning=true",
+            flush=True
+        )
+        return {"running": True, "connector_healthy": connector_status["connector_healthy"], "stage": "connectorHealthy" if connector_status["connector_healthy"] else "connectorStarting", "reason": None if connector_status["connector_healthy"] else connector_status["last_error_class"]}
+    cloudflared_binary = os.environ.get("BESMART_CLOUDFLARED_BIN", "cloudflared")
+    cloudflared_path = shutil.which(cloudflared_binary)
+    if cloudflared_path is None:
+        with timed_lock(SECURE_REMOTE_TUNNEL_LOCK, "secureRemoteTunnel", log_threshold_ms=5):
+            SECURE_REMOTE_TUNNEL_STARTING = False
+        print(
+            f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelProcessFailed route={safe_fingerprint(binding.get('route_id'))} stage=binaryLookup reason=cloudflaredMissing",
+            flush=True
+        )
+        return {"running": False, "stage": "binaryLookup", "reason": "cloudflaredMissing"}
+    print(
+        f"[SOSYNC-SECURE-REMOTE-COMPANION] cloudflaredBinaryResolved route={safe_fingerprint(binding.get('route_id'))} path={cloudflared_path}",
+        flush=True
+    )
+    env = os.environ.copy()
+    try:
+        stderr_path = secure_remote_tunnel_stderr_file()
+        os.makedirs(os.path.dirname(stderr_path), exist_ok=True)
+        with open(stderr_path, "wb") as stderr_file:
+            # Worker provisioning returns Cloudflare's connector token from
+            # /accounts/:account/cfd_tunnel/:id/token. The companion must
+            # launch cloudflared in token mode; the token is never logged.
+            command = [cloudflared_path, "--no-autoupdate", "tunnel", "run", "--token", token]
+            token_identity = decode_cloudflare_connector_token_identity(token)
             print(
-                f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelProcessConfirmed route={safe_fingerprint(binding.get('route_id'))} running=true reused=true connectorState={connector_status['connector_state']} connectorHealthy={connector_status['connector_healthy']} connectorConnectionCount={connector_status['connector_connection_count']} lastErrorClass={connector_status['last_error_class']}",
+                f"[SOSYNC-SECURE-REMOTE-IDENTITY] cloudflareConnectorTunnelIDHash={token_identity.get('cloudflare_connector_tunnel_id_hash')} connectorTunnelIdentityAvailable={str(bool(token_identity.get('available'))).lower()} connectorTunnelIdentityFailure={token_identity.get('failure') or 'none'} connectorTokenFormat={token_identity.get('connector_token_format') or 'unknown'} connectorTokenSegmentCount={token_identity.get('connector_token_segment_count')} connectorTokenDecodedObject={str(bool(token_identity.get('connector_token_decoded_object'))).lower()} connectorTokenDecodedKeys={','.join(token_identity.get('connector_token_decoded_keys') or [])} tunnelManagementMode=remoteManaged effectiveIngressSource=cloudflareApi cloudflaredRunning=false",
                 flush=True
             )
             print(
-                f"[SOSYNC-SECURE-REMOTE-IDENTITY] cloudflareConnectorTunnelIDHash={process_identity.get('cloudflare_connector_tunnel_id_hash')} connectorTunnelIdentityAvailable={str(bool(process_identity.get('available'))).lower()} connectorTunnelIdentityFailure={process_identity.get('failure') or 'none'} connectorTokenFormat={process_identity.get('connector_token_format') or 'unknown'} tunnelManagementMode=remoteManaged effectiveIngressSource=cloudflareApi cloudflaredRunning=true",
+                f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelProcessSpawnStarted route={safe_fingerprint(binding.get('route_id'))} mode=token tunnelManagementMode=remoteManaged localConfigSupplied=false effectiveIngressSource=cloudflareApi command={cloudflared_path} --no-autoupdate tunnel run --token [redacted]",
+                flush=True
+            )
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_file,
+                env=env
+            )
+        with timed_lock(SECURE_REMOTE_TUNNEL_LOCK, "secureRemoteTunnel", log_threshold_ms=5):
+            SECURE_REMOTE_TUNNEL_PROCESS = process
+        print(
+            f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelProcessStarted route={safe_fingerprint(binding.get('route_id'))} pidPresent={process.pid is not None}",
+            flush=True
+        )
+        deadline = time.time() + SECURE_REMOTE_TUNNEL_CONFIRMATION_SECONDS
+        first_exit_code = None
+        while time.time() < deadline:
+            exit_code = process.poll()
+            if exit_code is not None:
+                first_exit_code = exit_code
+                break
+            time.sleep(0.1)
+        if first_exit_code is not None:
+            stderr_excerpt = sanitized_secure_remote_tunnel_stderr(
+                read_secure_remote_tunnel_stderr_excerpt(),
+                token
+            )
+            print(
+                f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelProcessFailed route={safe_fingerprint(binding.get('route_id'))} stage=immediateExit reason=exited code={first_exit_code} stderr={stderr_excerpt}",
+                flush=True
+            )
+            with timed_lock(SECURE_REMOTE_TUNNEL_LOCK, "secureRemoteTunnel", log_threshold_ms=5):
+                if SECURE_REMOTE_TUNNEL_PROCESS is process:
+                    SECURE_REMOTE_TUNNEL_PROCESS = None
+                SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY = None
+                SECURE_REMOTE_TUNNEL_STARTING = False
+            return {"running": False, "stage": "immediateExit", "reason": "processExited"}
+        if process.poll() is None:
+            connector_status = wait_for_secure_remote_connector_health(time.time() + SECURE_REMOTE_CONNECTOR_CONFIRMATION_SECONDS, process_locked=True)
+            with timed_lock(SECURE_REMOTE_TUNNEL_LOCK, "secureRemoteTunnel", log_threshold_ms=5):
+                if SECURE_REMOTE_TUNNEL_PROCESS is process:
+                    SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY = token_identity
+                SECURE_REMOTE_TUNNEL_STARTING = False
+            print(
+                f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelProcessConfirmed route={safe_fingerprint(binding.get('route_id'))} running=true connectorState={connector_status['connector_state']} connectorHealthy={connector_status['connector_healthy']} connectorConnectionCount={connector_status['connector_connection_count']} lastErrorClass={connector_status['last_error_class']}",
+                flush=True
+            )
+            print(
+                f"[SOSYNC-SECURE-REMOTE-IDENTITY] cloudflareConnectorTunnelIDHash={token_identity.get('cloudflare_connector_tunnel_id_hash')} connectorTunnelIdentityAvailable={str(bool(token_identity.get('available'))).lower()} connectorTunnelIdentityFailure={token_identity.get('failure') or 'none'} connectorTokenFormat={token_identity.get('connector_token_format') or 'unknown'} connectorTokenSegmentCount={token_identity.get('connector_token_segment_count')} connectorTokenDecodedObject={str(bool(token_identity.get('connector_token_decoded_object'))).lower()} connectorTokenDecodedKeys={','.join(token_identity.get('connector_token_decoded_keys') or [])} tunnelManagementMode=remoteManaged effectiveIngressSource=cloudflareApi cloudflaredRunning=true",
                 flush=True
             )
             return {"running": True, "connector_healthy": connector_status["connector_healthy"], "stage": "connectorHealthy" if connector_status["connector_healthy"] else "connectorStarting", "reason": None if connector_status["connector_healthy"] else connector_status["last_error_class"]}
-        cloudflared_binary = os.environ.get("BESMART_CLOUDFLARED_BIN", "cloudflared")
-        cloudflared_path = shutil.which(cloudflared_binary)
-        if cloudflared_path is None:
-            print(
-                f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelProcessFailed route={safe_fingerprint(binding.get('route_id'))} stage=binaryLookup reason=cloudflaredMissing",
-                flush=True
-            )
-            return {"running": False, "stage": "binaryLookup", "reason": "cloudflaredMissing"}
         print(
-            f"[SOSYNC-SECURE-REMOTE-COMPANION] cloudflaredBinaryResolved route={safe_fingerprint(binding.get('route_id'))} path={cloudflared_path}",
+            f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelProcessFailed route={safe_fingerprint(binding.get('route_id'))} stage=confirmationTimeout reason=notRunning",
             flush=True
         )
-        env = os.environ.copy()
-        try:
-            stderr_path = secure_remote_tunnel_stderr_file()
-            os.makedirs(os.path.dirname(stderr_path), exist_ok=True)
-            with open(stderr_path, "wb") as stderr_file:
-                # Worker provisioning returns Cloudflare's connector token from
-                # /accounts/:account/cfd_tunnel/:id/token. The companion must
-                # launch cloudflared in token mode; the token is never logged.
-                command = [cloudflared_path, "--no-autoupdate", "tunnel", "run", "--token", token]
-                token_identity = decode_cloudflare_connector_token_identity(token)
-                print(
-                    f"[SOSYNC-SECURE-REMOTE-IDENTITY] cloudflareConnectorTunnelIDHash={token_identity.get('cloudflare_connector_tunnel_id_hash')} connectorTunnelIdentityAvailable={str(bool(token_identity.get('available'))).lower()} connectorTunnelIdentityFailure={token_identity.get('failure') or 'none'} connectorTokenFormat={token_identity.get('connector_token_format') or 'unknown'} connectorTokenSegmentCount={token_identity.get('connector_token_segment_count')} connectorTokenDecodedObject={str(bool(token_identity.get('connector_token_decoded_object'))).lower()} connectorTokenDecodedKeys={','.join(token_identity.get('connector_token_decoded_keys') or [])} tunnelManagementMode=remoteManaged effectiveIngressSource=cloudflareApi cloudflaredRunning=false",
-                    flush=True
-                )
-                print(
-                    f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelProcessSpawnStarted route={safe_fingerprint(binding.get('route_id'))} mode=token tunnelManagementMode=remoteManaged localConfigSupplied=false effectiveIngressSource=cloudflareApi command={cloudflared_path} --no-autoupdate tunnel run --token [redacted]",
-                    flush=True
-                )
-                SECURE_REMOTE_TUNNEL_PROCESS = subprocess.Popen(
-                    command,
-                    stdout=subprocess.DEVNULL,
-                    stderr=stderr_file,
-                    env=env
-                )
-            print(
-                f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelProcessStarted route={safe_fingerprint(binding.get('route_id'))} pidPresent={SECURE_REMOTE_TUNNEL_PROCESS.pid is not None}",
-                flush=True
-            )
-            deadline = time.time() + SECURE_REMOTE_TUNNEL_CONFIRMATION_SECONDS
-            first_exit_code = None
-            while time.time() < deadline:
-                exit_code = SECURE_REMOTE_TUNNEL_PROCESS.poll()
-                if exit_code is not None:
-                    first_exit_code = exit_code
-                    break
-                time.sleep(0.1)
-            if first_exit_code is not None:
-                stderr_excerpt = sanitized_secure_remote_tunnel_stderr(
-                    read_secure_remote_tunnel_stderr_excerpt(),
-                    token
-                )
-                print(
-                    f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelProcessFailed route={safe_fingerprint(binding.get('route_id'))} stage=immediateExit reason=exited code={first_exit_code} stderr={stderr_excerpt}",
-                    flush=True
-                )
+        with timed_lock(SECURE_REMOTE_TUNNEL_LOCK, "secureRemoteTunnel", log_threshold_ms=5):
+            if SECURE_REMOTE_TUNNEL_PROCESS is process:
                 SECURE_REMOTE_TUNNEL_PROCESS = None
-                SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY = None
-                return {"running": False, "stage": "immediateExit", "reason": "processExited"}
-            if SECURE_REMOTE_TUNNEL_PROCESS.poll() is None:
-                SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY = token_identity
-                connector_status = wait_for_secure_remote_connector_health(time.time() + SECURE_REMOTE_CONNECTOR_CONFIRMATION_SECONDS, process_locked=True)
-                print(
-                    f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelProcessConfirmed route={safe_fingerprint(binding.get('route_id'))} running=true connectorState={connector_status['connector_state']} connectorHealthy={connector_status['connector_healthy']} connectorConnectionCount={connector_status['connector_connection_count']} lastErrorClass={connector_status['last_error_class']}",
-                    flush=True
-                )
-                print(
-                    f"[SOSYNC-SECURE-REMOTE-IDENTITY] cloudflareConnectorTunnelIDHash={token_identity.get('cloudflare_connector_tunnel_id_hash')} connectorTunnelIdentityAvailable={str(bool(token_identity.get('available'))).lower()} connectorTunnelIdentityFailure={token_identity.get('failure') or 'none'} connectorTokenFormat={token_identity.get('connector_token_format') or 'unknown'} connectorTokenSegmentCount={token_identity.get('connector_token_segment_count')} connectorTokenDecodedObject={str(bool(token_identity.get('connector_token_decoded_object'))).lower()} connectorTokenDecodedKeys={','.join(token_identity.get('connector_token_decoded_keys') or [])} tunnelManagementMode=remoteManaged effectiveIngressSource=cloudflareApi cloudflaredRunning=true",
-                    flush=True
-                )
-                return {"running": True, "connector_healthy": connector_status["connector_healthy"], "stage": "connectorHealthy" if connector_status["connector_healthy"] else "connectorStarting", "reason": None if connector_status["connector_healthy"] else connector_status["last_error_class"]}
-            print(
-                f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelProcessFailed route={safe_fingerprint(binding.get('route_id'))} stage=confirmationTimeout reason=notRunning",
-                flush=True
-            )
+            SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY = None
+            SECURE_REMOTE_TUNNEL_STARTING = False
+        return {"running": False, "stage": "confirmationTimeout", "reason": "notRunning"}
+    except Exception as error:
+        print(
+            f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelProcessFailed route={safe_fingerprint(binding.get('route_id'))} stage=processStart reason={type(error).__name__}",
+            flush=True
+        )
+        with timed_lock(SECURE_REMOTE_TUNNEL_LOCK, "secureRemoteTunnel", log_threshold_ms=5):
             SECURE_REMOTE_TUNNEL_PROCESS = None
             SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY = None
-            return {"running": False, "stage": "confirmationTimeout", "reason": "notRunning"}
-        except Exception as error:
-            print(
-                f"[SOSYNC-SECURE-REMOTE-COMPANION] tunnelProcessFailed route={safe_fingerprint(binding.get('route_id'))} stage=processStart reason={type(error).__name__}",
-                flush=True
-            )
-            SECURE_REMOTE_TUNNEL_PROCESS = None
-            SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY = None
-            return {"running": False, "stage": "processStart", "reason": type(error).__name__}
+            SECURE_REMOTE_TUNNEL_STARTING = False
+        return {"running": False, "stage": "processStart", "reason": type(error).__name__}
 
 
 def stop_secure_remote_tunnel():
     global SECURE_REMOTE_TUNNEL_PROCESS
     global SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY
-    with SECURE_REMOTE_TUNNEL_LOCK:
+    with timed_lock(SECURE_REMOTE_TUNNEL_LOCK, "secureRemoteTunnel", log_threshold_ms=5):
         process = SECURE_REMOTE_TUNNEL_PROCESS
         SECURE_REMOTE_TUNNEL_PROCESS = None
         SECURE_REMOTE_TUNNEL_PROCESS_IDENTITY = None
@@ -3126,35 +3384,46 @@ def store_ha_upstream(url):
 
 
 def read_ha_upstream():
+    started_at = time.monotonic()
     try:
         with open(HA_UPSTREAM_FILE, "r", encoding="utf-8") as file:
             value = file.read().strip().rstrip("/")
+            companion_perf_log_if_slow("fileReadCompleted", elapsed_ms_since(started_at), path=os.path.basename(HA_UPSTREAM_FILE), bytes=len(value))
             return value or DEFAULT_HOME_ASSISTANT_URL
     except FileNotFoundError:
+        companion_perf_log_if_slow("fileReadDefaulted", elapsed_ms_since(started_at), path=os.path.basename(HA_UPSTREAM_FILE))
         return DEFAULT_HOME_ASSISTANT_URL
 
 
 def store_home_profile(profile):
     os.makedirs(os.path.dirname(HOME_PROFILE_FILE), exist_ok=True)
     temporary_file = f"{HOME_PROFILE_FILE}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
-    with HOME_PROFILE_WRITE_LOCK:
+    started_at = time.monotonic()
+    with timed_lock(HOME_PROFILE_WRITE_LOCK, "homeProfileWrite", log_threshold_ms=5):
         existing = read_home_profile()
         if existing == profile:
+            companion_perf_log("fileWriteSkipped", path=os.path.basename(HOME_PROFILE_FILE), elapsedMs=elapsed_ms_since(started_at), reason="unchanged")
             return
         with open(temporary_file, "w", encoding="utf-8") as file:
             json.dump(profile, file, separators=(",", ":"))
             file.flush()
             os.fsync(file.fileno())
         os.replace(temporary_file, HOME_PROFILE_FILE)
+    companion_perf_log("fileWriteCompleted", path=os.path.basename(HOME_PROFILE_FILE), elapsedMs=elapsed_ms_since(started_at))
 
 
 def read_home_profile():
+    started_at = time.monotonic()
     try:
         with open(HOME_PROFILE_FILE, "r", encoding="utf-8") as file:
-            return json.load(file)
+            value = json.load(file)
+            companion_perf_log_if_slow("fileReadCompleted", elapsed_ms_since(started_at), path=os.path.basename(HOME_PROFILE_FILE))
+            return value
     except FileNotFoundError:
+        companion_perf_log_if_slow("fileReadDefaulted", elapsed_ms_since(started_at), path=os.path.basename(HOME_PROFILE_FILE))
         return None
     except json.JSONDecodeError:
+        companion_perf_log("fileReadDefaulted", path=os.path.basename(HOME_PROFILE_FILE), elapsedMs=elapsed_ms_since(started_at), reason="jsonDecode")
         return None
 
 
