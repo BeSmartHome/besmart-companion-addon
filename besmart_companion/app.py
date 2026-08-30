@@ -97,6 +97,7 @@ COMPANION_CACHE_LOCK = threading.Lock()
 COMPANION_ACTIVE_HTTP_REQUESTS = 0
 COMPANION_ACTIVE_WEBSOCKETS = 0
 COMPANION_REQUEST_SEQUENCE = 0
+COMPANION_E2EE_SESSION_CORRELATION = {}
 COMPANION_IDENTITY_CACHE = None
 E2EE_IDENTITY_CACHE = None
 E2EE_PUBLIC_KEY_NORMALIZATION_CACHE = {}
@@ -237,6 +238,7 @@ def companion_dataplane_checkpoint(event, request_id, started_at, **fields):
         "[SOSYNC-COMPANION-DATAPLANE-TIMING]",
         f"event={event}",
         f"requestID={request_id}",
+        f"correlationID={e2ee_session_correlation(request_id)}",
         f"elapsedMs={elapsed_ms_since(started_at)}",
         f"thread={threading.get_ident()}",
         f"activeHTTP={active_http}",
@@ -245,6 +247,84 @@ def companion_dataplane_checkpoint(event, request_id, started_at, **fields):
     for key, value in fields.items():
         parts.append(f"{key}={value}")
     print(" ".join(parts), flush=True)
+
+
+def websocket_age_ms(reference_at):
+    if not reference_at:
+        return "none"
+    return elapsed_ms_since(reference_at)
+
+
+def secure_remote_websocket_lifecycle(
+    event,
+    request_id,
+    started_at,
+    binding,
+    session_id,
+    first_terminated_direction="none",
+    exception=None,
+    last_inbound_client_frame_at=None,
+    last_outbound_client_frame_at=None,
+    last_upstream_ha_frame_at=None,
+    last_heartbeat_at=None,
+    **fields
+):
+    started_at = started_at or time.monotonic()
+    active_http, active_websockets = companion_runtime_counts_unlocked()
+    exception_class = type(exception).__name__ if exception else "none"
+    exception_category = "none"
+    if exception:
+        message = str(exception)
+        if isinstance(exception, ConnectionError) and "socket_closed" in message:
+            exception_category = "eof"
+        elif isinstance(exception, BrokenPipeError):
+            exception_category = "brokenPipe"
+        elif isinstance(exception, TimeoutError):
+            exception_category = "timeout"
+        elif isinstance(exception, OSError):
+            exception_category = "socketError"
+        else:
+            exception_category = "handlerException"
+    parts = [
+        "[SOSYNC-SECURE-REMOTE-WS-LIFECYCLE]",
+        f"event={event}",
+        f"requestID={request_id}",
+        f"correlationID={e2ee_session_correlation(request_id)}",
+        f"route={safe_fingerprint(binding.get('route_id'))}",
+        f"session={safe_fingerprint(session_id)}",
+        f"lifetimeMs={elapsed_ms_since(started_at)}",
+        f"lastInboundClientFrameAgeMs={websocket_age_ms(last_inbound_client_frame_at)}",
+        f"lastOutboundClientFrameAgeMs={websocket_age_ms(last_outbound_client_frame_at)}",
+        f"lastUpstreamHAFrameAgeMs={websocket_age_ms(last_upstream_ha_frame_at)}",
+        f"lastHeartbeatAgeMs={websocket_age_ms(last_heartbeat_at)}",
+        f"firstTerminatedDirection={first_terminated_direction}",
+        f"exceptionClass={exception_class}",
+        f"exceptionCategory={exception_category}",
+        f"thread={threading.get_ident()}",
+        f"activeHTTP={active_http}",
+        f"activeWebSockets={active_websockets}",
+    ]
+    for key, value in fields.items():
+        parts.append(f"{key}={value}")
+    print(" ".join(parts), flush=True)
+
+
+def set_e2ee_session_correlation(request_id, correlation_id):
+    candidate = str(correlation_id or "none").strip()
+    if not candidate:
+        candidate = "none"
+    with COMPANION_REQUEST_LOCK:
+        COMPANION_E2EE_SESSION_CORRELATION[request_id] = candidate
+
+
+def e2ee_session_correlation(request_id):
+    with COMPANION_REQUEST_LOCK:
+        return COMPANION_E2EE_SESSION_CORRELATION.get(request_id, "none")
+
+
+def clear_e2ee_session_correlation(request_id):
+    with COMPANION_REQUEST_LOCK:
+        COMPANION_E2EE_SESSION_CORRELATION.pop(request_id, None)
 
 
 def note_secure_remote_binding_stat(kind, count=1):
@@ -322,6 +402,7 @@ class Handler(BaseHTTPRequestHandler):
                     getattr(self, "path", "unknown"),
                     started_at
                 )
+                clear_e2ee_session_correlation(request_id)
                 self._sosync_request_id = None
                 self._sosync_request_started_at = None
 
@@ -385,6 +466,7 @@ class Handler(BaseHTTPRequestHandler):
         message = (
             "[SOSYNC-E2EE-SESSION-TIMING] "
             f"requestID={self._request_id_for_log()} "
+            f"correlationID={e2ee_session_correlation(self._request_id_for_log())} "
             f"stage={stage} "
             f"elapsedMs={elapsed_ms_since(started_at)}"
         )
@@ -902,6 +984,14 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_secure_remote_dataplane_session(self):
         timing_started_at = self._session_timing_started_at()
         request_id = self._request_id_for_log()
+        correlation_header = self.headers.get("X-SoSync-E2EE-Session-Correlation")
+        set_e2ee_session_correlation(request_id, correlation_header)
+        companion_dataplane_checkpoint(
+            "sessionCorrelationReceived",
+            request_id,
+            timing_started_at,
+            headerPresent=str(bool(correlation_header)).lower()
+        )
         companion_dataplane_checkpoint("requestEntered", request_id, timing_started_at)
         companion_dataplane_checkpoint("dependenciesLoadStart", request_id, timing_started_at)
         companion_dataplane_checkpoint("dependenciesLoadComplete", request_id, timing_started_at)
@@ -974,6 +1064,7 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_secure_remote_dataplane_websocket(self):
         timing_started_at = self._session_timing_started_at()
         request_id = self._request_id_for_log()
+        set_e2ee_session_correlation(request_id, self.headers.get("x-sosync-e2ee-session-correlation"))
         companion_dataplane_checkpoint("encryptedWebSocketRequestEntered", request_id, timing_started_at)
         binding = self._authorize_secure_remote_dataplane(timing_started_at=timing_started_at)
         if not binding:
@@ -1016,7 +1107,12 @@ class Handler(BaseHTTPRequestHandler):
                 finally:
                     companion_websocket_completed(binding.get("route_id"), session_id, websocket_started_at)
         except Exception as error:
-            print(f"[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionEncryptedWebSocketClosed reason={type(error).__name__}", flush=True)
+            print(
+                f"[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionEncryptedWebSocketClosed "
+                f"reason={type(error).__name__} requestID={request_id} "
+                f"correlationID={e2ee_session_correlation(request_id)}",
+                flush=True
+            )
             try:
                 self._json(502, {"error": "encrypted_websocket_failed"})
             except Exception:
@@ -1625,6 +1721,7 @@ def log_e2ee_session_timing(request_id, timing_started_at, stage, lock_wait_ms=N
     message = (
         "[SOSYNC-E2EE-SESSION-TIMING] "
         f"requestID={request_id} "
+        f"correlationID={e2ee_session_correlation(request_id)} "
         f"stage={stage} "
         f"thread={threading.get_ident()} "
         f"activeHTTP={active_http} "
@@ -1679,7 +1776,12 @@ def create_secure_remote_dataplane_session(binding, request, request_id="unknown
     )
     public_key_started_at = time.monotonic()
     companion_dataplane_checkpoint("sessionDevicePublicKeyNormalizeStart", request_id, timing_started_at)
-    device_public_key = normalized_e2ee_public_key(request.get("device_public_key"))
+    device_public_key = normalized_e2ee_public_key(
+        request.get("device_public_key"),
+        request_id=request_id,
+        timing_started_at=timing_started_at,
+        label="sessionDevicePublicKey"
+    )
     companion_dataplane_checkpoint(
         "sessionDevicePublicKeyNormalizeComplete",
         request_id,
@@ -1689,7 +1791,12 @@ def create_secure_remote_dataplane_session(binding, request, request_id="unknown
     )
     ephemeral_key_started_at = time.monotonic()
     companion_dataplane_checkpoint("sessionEphemeralPublicKeyNormalizeStart", request_id, timing_started_at)
-    device_ephemeral_public_key = normalized_e2ee_public_key(request.get("device_ephemeral_public_key"))
+    device_ephemeral_public_key = normalized_e2ee_public_key(
+        request.get("device_ephemeral_public_key"),
+        request_id=request_id,
+        timing_started_at=timing_started_at,
+        label="sessionEphemeralPublicKey"
+    )
     companion_dataplane_checkpoint(
         "sessionEphemeralPublicKeyNormalizeComplete",
         request_id,
@@ -1992,6 +2099,36 @@ def log_encrypted_websocket_outbound(binding, session_id, opcode, plaintext_byte
     )
 
 
+def companion_command_latency(stage, request_id, command_id, ha_command_id, started_at, **fields):
+    parts = [
+        "[SOSYNC-COMMAND-LATENCY]",
+        f"side=companion",
+        f"phase={stage}",
+        f"requestID={request_id}",
+        f"correlationID={e2ee_session_correlation(request_id)}",
+        f"commandID={command_id or 'none'}",
+        f"haCommandID={ha_command_id if ha_command_id is not None else 'none'}",
+        f"elapsedMs={elapsed_ms_since(started_at)}",
+    ]
+    for key, value in fields.items():
+        parts.append(f"{key}={value}")
+    print(" ".join(parts), flush=True)
+
+
+def ha_call_service_target_count(decoded_client_object):
+    if not isinstance(decoded_client_object, dict):
+        return 0
+    target = decoded_client_object.get("target")
+    if not isinstance(target, dict):
+        return 0
+    entity_id = target.get("entity_id")
+    if isinstance(entity_id, list):
+        return len([value for value in entity_id if isinstance(value, str) and value.strip()])
+    if isinstance(entity_id, str) and entity_id.strip():
+        return 1
+    return 0
+
+
 def perform_secure_remote_dataplane_rest(method, ha_path, headers, body_base64url):
     target_url = f"{read_ha_upstream()}{ha_path}"
     request_body = base64url_decode(body_base64url) if body_base64url else None
@@ -2020,6 +2157,12 @@ def perform_secure_remote_dataplane_rest(method, ha_path, headers, body_base64ur
 
 def bridge_secure_remote_dataplane_websocket(client_socket, upstream_socket, binding, session_id, request_id="unknown", timing_started_at=None):
     sockets = [client_socket, upstream_socket]
+    bridge_started_at = time.monotonic()
+    last_inbound_client_frame_at = None
+    last_outbound_client_frame_at = None
+    last_upstream_ha_frame_at = None
+    last_heartbeat_at = None
+    first_terminated_direction = "none"
     next_revocation_check_at = 0
     did_log_first_upstream_frame = False
     did_log_first_encrypted_outbound = False
@@ -2028,6 +2171,14 @@ def bridge_secure_remote_dataplane_websocket(client_socket, upstream_socket, bin
     did_log_first_client_decrypt = False
     did_log_first_upstream_auth_write = False
     did_log_first_upstream_auth_written = False
+    command_timings = {}
+    secure_remote_websocket_lifecycle(
+        "relayStarted",
+        request_id,
+        bridge_started_at,
+        binding,
+        session_id
+    )
     try:
         while True:
             now = time.monotonic()
@@ -2045,6 +2196,20 @@ def bridge_secure_remote_dataplane_websocket(client_socket, upstream_socket, bin
                 )
                 next_revocation_check_at = now + SECURE_REMOTE_DATAPLANE_REVOCATION_POLL_SECONDS
                 if current_binding.get("status") == "revoked" or not session_present:
+                    first_terminated_direction = "companionRevocation"
+                    secure_remote_websocket_lifecycle(
+                        "relayTerminating",
+                        request_id,
+                        bridge_started_at,
+                        binding,
+                        session_id,
+                        first_terminated_direction=first_terminated_direction,
+                        last_inbound_client_frame_at=last_inbound_client_frame_at,
+                        last_outbound_client_frame_at=last_outbound_client_frame_at,
+                        last_upstream_ha_frame_at=last_upstream_ha_frame_at,
+                        last_heartbeat_at=last_heartbeat_at,
+                        reason="revocationOrSessionMissing"
+                    )
                     print(
                         f"[SOSYNC-SECURE-REMOTE-DATAPLANE] event=companionEncryptedWebSocketRevocationClosed route={safe_fingerprint(binding.get('route_id'))} maxRevocationEnforcementSeconds=60",
                         flush=True
@@ -2053,59 +2218,355 @@ def bridge_secure_remote_dataplane_websocket(client_socket, upstream_socket, bin
             readable, _, _ = select.select(sockets, [], [], 0.5)
             for source in readable:
                 if source is client_socket:
-                    opcode, payload = read_websocket_frame(client_socket)
+                    try:
+                        opcode, payload = read_websocket_frame(client_socket)
+                    except Exception as error:
+                        first_terminated_direction = "downstreamClientRead"
+                        secure_remote_websocket_lifecycle(
+                            "relayTerminated",
+                            request_id,
+                            bridge_started_at,
+                            binding,
+                            session_id,
+                            first_terminated_direction=first_terminated_direction,
+                            exception=error,
+                            last_inbound_client_frame_at=last_inbound_client_frame_at,
+                            last_outbound_client_frame_at=last_outbound_client_frame_at,
+                            last_upstream_ha_frame_at=last_upstream_ha_frame_at,
+                            last_heartbeat_at=last_heartbeat_at
+                        )
+                        raise
+                    last_inbound_client_frame_at = time.monotonic()
                     if not did_log_first_client_frame:
                         did_log_first_client_frame = True
                         companion_dataplane_checkpoint("firstEncryptedInboundClientFrameReceived", request_id, timing_started_at, session=safe_fingerprint(session_id), opcode=websocket_opcode_class(opcode), bytes=len(payload))
                     if opcode in (0x8, None):
+                        first_terminated_direction = "downstreamClientClose"
+                        secure_remote_websocket_lifecycle(
+                            "relayTerminated",
+                            request_id,
+                            bridge_started_at,
+                            binding,
+                            session_id,
+                            first_terminated_direction=first_terminated_direction,
+                            last_inbound_client_frame_at=last_inbound_client_frame_at,
+                            last_outbound_client_frame_at=last_outbound_client_frame_at,
+                            last_upstream_ha_frame_at=last_upstream_ha_frame_at,
+                            last_heartbeat_at=last_heartbeat_at,
+                            opcode=websocket_opcode_class(opcode)
+                        )
                         return
                     if opcode == 0x9:
-                        write_websocket_frame(client_socket, 0xA, payload, mask=False)
+                        last_heartbeat_at = time.monotonic()
+                        try:
+                            write_websocket_frame(client_socket, 0xA, payload, mask=False)
+                        except Exception as error:
+                            first_terminated_direction = "downstreamClientWrite"
+                            secure_remote_websocket_lifecycle(
+                                "relayTerminated",
+                                request_id,
+                                bridge_started_at,
+                                binding,
+                                session_id,
+                                first_terminated_direction=first_terminated_direction,
+                                exception=error,
+                                last_inbound_client_frame_at=last_inbound_client_frame_at,
+                                last_outbound_client_frame_at=last_outbound_client_frame_at,
+                                last_upstream_ha_frame_at=last_upstream_ha_frame_at,
+                                last_heartbeat_at=last_heartbeat_at,
+                                attemptedWrite="pongToClient"
+                            )
+                            raise
                         continue
                     if opcode == 0xA:
+                        last_heartbeat_at = time.monotonic()
                         continue
                     if opcode != 0x1:
                         raise ValueError(f"unsupported_client_websocket_opcode_{websocket_opcode_class(opcode)}")
                     envelope = json.loads(payload.decode("utf-8"))
+                    command_id = envelope.get("message_id") if isinstance(envelope, dict) else None
+                    decrypt_started_at = time.monotonic()
                     plaintext = decrypt_secure_remote_dataplane_envelope(binding, envelope, "client_to_companion", enforce_expiry=False)
+                    try:
+                        decoded_client_object = json.loads(plaintext.decode("utf-8"))
+                    except Exception:
+                        decoded_client_object = {}
+                    ha_command_id = decoded_client_object.get("id") if isinstance(decoded_client_object, dict) else None
+                    ha_type = decoded_client_object.get("type") if isinstance(decoded_client_object, dict) else None
+                    if ha_type == "call_service":
+                        target_count = ha_call_service_target_count(decoded_client_object)
+                        command_timings[ha_command_id] = {
+                            "command_id": command_id,
+                            "started_at": decrypt_started_at,
+                            "target_count": target_count,
+                        }
+                        companion_command_latency(
+                            "companionInboundFrameDecrypted",
+                            request_id,
+                            command_id,
+                            ha_command_id,
+                            decrypt_started_at,
+                            segmentMs=elapsed_ms_since(decrypt_started_at),
+                            plaintextBytes=len(plaintext),
+                            targetCount=target_count,
+                        )
                     if not did_log_first_client_decrypt:
                         did_log_first_client_decrypt = True
                         companion_dataplane_checkpoint("firstInboundFrameDecrypted", request_id, timing_started_at, session=safe_fingerprint(session_id), bytes=len(plaintext))
                     if not did_log_first_upstream_auth_write:
                         did_log_first_upstream_auth_write = True
                         companion_dataplane_checkpoint("firstUpstreamHAAuthFrameWriteStart", request_id, timing_started_at, session=safe_fingerprint(session_id), bytes=len(plaintext))
-                    write_websocket_frame(upstream_socket, 0x1, plaintext, mask=False)
+                    try:
+                        if ha_type == "call_service":
+                            target_count = command_timings[ha_command_id].get("target_count", 0)
+                            upstream_write_started_at = time.monotonic()
+                            command_timings[ha_command_id]["upstream_write_started_at"] = upstream_write_started_at
+                            companion_command_latency(
+                                "upstreamHAWriteStart",
+                                request_id,
+                                command_id,
+                                ha_command_id,
+                                command_timings[ha_command_id]["started_at"],
+                                bytes=len(plaintext),
+                                targetCount=target_count,
+                            )
+                        write_websocket_frame(upstream_socket, 0x1, plaintext, mask=False)
+                        if ha_type == "call_service":
+                            target_count = command_timings[ha_command_id].get("target_count", 0)
+                            upstream_write_started_at = command_timings[ha_command_id].get("upstream_write_started_at", time.monotonic())
+                            companion_command_latency(
+                                "upstreamHAWriteComplete",
+                                request_id,
+                                command_id,
+                                ha_command_id,
+                                command_timings[ha_command_id]["started_at"],
+                                bytes=len(plaintext),
+                                segmentMs=elapsed_ms_since(upstream_write_started_at),
+                                targetCount=target_count,
+                            )
+                    except Exception as error:
+                        first_terminated_direction = "upstreamHAWrite"
+                        secure_remote_websocket_lifecycle(
+                            "relayTerminated",
+                            request_id,
+                            bridge_started_at,
+                            binding,
+                            session_id,
+                            first_terminated_direction=first_terminated_direction,
+                            exception=error,
+                            last_inbound_client_frame_at=last_inbound_client_frame_at,
+                            last_outbound_client_frame_at=last_outbound_client_frame_at,
+                            last_upstream_ha_frame_at=last_upstream_ha_frame_at,
+                            last_heartbeat_at=last_heartbeat_at,
+                            attemptedWrite="plaintextToUpstreamHA"
+                        )
+                        raise
                     if not did_log_first_upstream_auth_written:
                         did_log_first_upstream_auth_written = True
                         companion_dataplane_checkpoint("firstUpstreamHAAuthFrameWritten", request_id, timing_started_at, session=safe_fingerprint(session_id), bytes=len(plaintext))
                 else:
-                    opcode, payload = read_websocket_frame(upstream_socket)
+                    try:
+                        opcode, payload = read_websocket_frame(upstream_socket)
+                    except Exception as error:
+                        first_terminated_direction = "upstreamHARead"
+                        secure_remote_websocket_lifecycle(
+                            "relayTerminated",
+                            request_id,
+                            bridge_started_at,
+                            binding,
+                            session_id,
+                            first_terminated_direction=first_terminated_direction,
+                            exception=error,
+                            last_inbound_client_frame_at=last_inbound_client_frame_at,
+                            last_outbound_client_frame_at=last_outbound_client_frame_at,
+                            last_upstream_ha_frame_at=last_upstream_ha_frame_at,
+                            last_heartbeat_at=last_heartbeat_at
+                        )
+                        raise
+                    last_upstream_ha_frame_at = time.monotonic()
                     if not did_log_first_upstream_frame:
                         did_log_first_upstream_frame = True
                         companion_dataplane_checkpoint("firstUpstreamHAFrameReceived", request_id, timing_started_at, session=safe_fingerprint(session_id), opcode=websocket_opcode_class(opcode), bytes=len(payload))
                     if opcode in (0x8, None):
+                        first_terminated_direction = "upstreamHAClose"
+                        secure_remote_websocket_lifecycle(
+                            "relayTerminated",
+                            request_id,
+                            bridge_started_at,
+                            binding,
+                            session_id,
+                            first_terminated_direction=first_terminated_direction,
+                            last_inbound_client_frame_at=last_inbound_client_frame_at,
+                            last_outbound_client_frame_at=last_outbound_client_frame_at,
+                            last_upstream_ha_frame_at=last_upstream_ha_frame_at,
+                            last_heartbeat_at=last_heartbeat_at,
+                            opcode=websocket_opcode_class(opcode)
+                        )
                         return
                     if opcode == 0x9:
+                        last_heartbeat_at = time.monotonic()
                         log_encrypted_websocket_outbound(binding, session_id, opcode, len(payload), classification="heartbeatSkipped")
-                        write_websocket_frame(upstream_socket, 0xA, payload, mask=False)
+                        try:
+                            write_websocket_frame(upstream_socket, 0xA, payload, mask=False)
+                        except Exception as error:
+                            first_terminated_direction = "upstreamHAWrite"
+                            secure_remote_websocket_lifecycle(
+                                "relayTerminated",
+                                request_id,
+                                bridge_started_at,
+                                binding,
+                                session_id,
+                                first_terminated_direction=first_terminated_direction,
+                                exception=error,
+                                last_inbound_client_frame_at=last_inbound_client_frame_at,
+                                last_outbound_client_frame_at=last_outbound_client_frame_at,
+                                last_upstream_ha_frame_at=last_upstream_ha_frame_at,
+                                last_heartbeat_at=last_heartbeat_at,
+                                attemptedWrite="pongToUpstreamHA"
+                            )
+                            raise
                         continue
                     if opcode == 0xA:
+                        last_heartbeat_at = time.monotonic()
                         log_encrypted_websocket_outbound(binding, session_id, opcode, len(payload), classification="heartbeatSkipped")
                         continue
                     if opcode != 0x1:
                         log_encrypted_websocket_outbound(binding, session_id, opcode, len(payload), classification="unsupportedControl")
                         raise ValueError(f"unsupported_upstream_websocket_opcode_{websocket_opcode_class(opcode)}")
+                    response_command_id = None
+                    response_started_at = time.monotonic()
+                    response_ha_command_id = None
+                    try:
+                        upstream_object = json.loads(payload.decode("utf-8"))
+                    except Exception:
+                        upstream_object = {}
+                    if isinstance(upstream_object, dict) and upstream_object.get("type") == "result":
+                        response_ha_command_id = upstream_object.get("id")
+                        timing = command_timings.get(response_ha_command_id)
+                        if timing:
+                            response_command_id = timing.get("command_id")
+                            response_started_at = timing.get("started_at") or response_started_at
+                            response_target_count = timing.get("target_count", 0)
+                            companion_command_latency(
+                                "upstreamHAResultReceived",
+                                request_id,
+                                response_command_id,
+                                response_ha_command_id,
+                                response_started_at,
+                                success=upstream_object.get("success", "unknown"),
+                                bytes=len(payload),
+                                targetCount=response_target_count,
+                            )
+                            companion_command_latency(
+                                "companionResponseEncryptStart",
+                                request_id,
+                                response_command_id,
+                                response_ha_command_id,
+                                response_started_at,
+                                targetCount=response_target_count,
+                            )
+                            command_timings[response_ha_command_id]["response_encrypt_started_at"] = time.monotonic()
+                    response_encrypt_started_at = time.monotonic()
                     envelope = encrypt_secure_remote_dataplane_envelope(binding, session_id, payload, "companion_to_client", f"ws-event-{uuid.uuid4()}", enforce_expiry=False)
+                    if response_command_id:
+                        response_target_count = command_timings.get(response_ha_command_id, {}).get("target_count", 0)
+                        response_encrypt_started_at = command_timings.get(response_ha_command_id, {}).get("response_encrypt_started_at", response_encrypt_started_at)
+                        companion_command_latency(
+                            "companionResponseEncryptComplete",
+                            request_id,
+                            response_command_id,
+                            response_ha_command_id,
+                            response_started_at,
+                            envelopeSequence=envelope.get("sequence"),
+                            segmentMs=elapsed_ms_since(response_encrypt_started_at),
+                            targetCount=response_target_count,
+                        )
                     if not did_log_first_encrypted_outbound:
                         did_log_first_encrypted_outbound = True
                         companion_dataplane_checkpoint("firstEncryptedOutboundFrameGenerated", request_id, timing_started_at, session=safe_fingerprint(session_id), sequence=envelope.get("sequence"), plaintextBytes=len(payload))
                     envelope_bytes = json.dumps(envelope, separators=(",", ":")).encode("utf-8")
                     log_encrypted_websocket_outbound(binding, session_id, opcode, len(payload), envelope=envelope, envelope_bytes=len(envelope_bytes), classification="data")
-                    write_websocket_frame(client_socket, 0x1, envelope_bytes, mask=False)
+                    try:
+                        if response_command_id:
+                            response_target_count = command_timings.get(response_ha_command_id, {}).get("target_count", 0)
+                            response_write_started_at = time.monotonic()
+                            command_timings[response_ha_command_id]["response_write_started_at"] = response_write_started_at
+                            companion_command_latency(
+                                "companionResponseWriteStart",
+                                request_id,
+                                response_command_id,
+                                response_ha_command_id,
+                                response_started_at,
+                                envelopeBytes=len(envelope_bytes),
+                                targetCount=response_target_count,
+                            )
+                        write_websocket_frame(client_socket, 0x1, envelope_bytes, mask=False)
+                        last_outbound_client_frame_at = time.monotonic()
+                        if response_command_id:
+                            response_target_count = command_timings.get(response_ha_command_id, {}).get("target_count", 0)
+                            response_write_started_at = command_timings.get(response_ha_command_id, {}).get("response_write_started_at", time.monotonic())
+                            companion_command_latency(
+                                "companionResponseWriteComplete",
+                                request_id,
+                                response_command_id,
+                                response_ha_command_id,
+                                response_started_at,
+                                envelopeBytes=len(envelope_bytes),
+                                segmentMs=elapsed_ms_since(response_write_started_at),
+                                targetCount=response_target_count,
+                            )
+                            command_timings.pop(response_ha_command_id, None)
+                    except Exception as error:
+                        first_terminated_direction = "downstreamClientWrite"
+                        secure_remote_websocket_lifecycle(
+                            "relayTerminated",
+                            request_id,
+                            bridge_started_at,
+                            binding,
+                            session_id,
+                            first_terminated_direction=first_terminated_direction,
+                            exception=error,
+                            last_inbound_client_frame_at=last_inbound_client_frame_at,
+                            last_outbound_client_frame_at=last_outbound_client_frame_at,
+                            last_upstream_ha_frame_at=last_upstream_ha_frame_at,
+                            last_heartbeat_at=last_heartbeat_at,
+                            attemptedWrite="encryptedEnvelopeToClient",
+                            envelopeBytes=len(envelope_bytes)
+                        )
+                        raise
                     if not did_log_first_encrypted_outbound_write:
                         did_log_first_encrypted_outbound_write = True
                         companion_dataplane_checkpoint("firstEncryptedOutboundFrameWritten", request_id, timing_started_at, session=safe_fingerprint(session_id), sequence=envelope.get("sequence"), envelopeBytes=len(envelope_bytes))
+    except Exception as error:
+        if first_terminated_direction == "none":
+            first_terminated_direction = "handlerException"
+            secure_remote_websocket_lifecycle(
+                "relayTerminated",
+                request_id,
+                bridge_started_at,
+                binding,
+                session_id,
+                first_terminated_direction=first_terminated_direction,
+                exception=error,
+                last_inbound_client_frame_at=last_inbound_client_frame_at,
+                last_outbound_client_frame_at=last_outbound_client_frame_at,
+                last_upstream_ha_frame_at=last_upstream_ha_frame_at,
+                last_heartbeat_at=last_heartbeat_at
+            )
+        raise
     finally:
+        secure_remote_websocket_lifecycle(
+            "relayFinishedCleanup",
+            request_id,
+            bridge_started_at,
+            binding,
+            session_id,
+            first_terminated_direction=first_terminated_direction,
+            last_inbound_client_frame_at=last_inbound_client_frame_at,
+            last_outbound_client_frame_at=last_outbound_client_frame_at,
+            last_upstream_ha_frame_at=last_upstream_ha_frame_at,
+            last_heartbeat_at=last_heartbeat_at
+        )
         with timed_lock(SECURE_REMOTE_DATAPLANE_LOCK, "dataplaneSessionRemove", log_threshold_ms=10):
             SECURE_REMOTE_DATAPLANE_SESSIONS.pop((binding.get("route_id"), str(session_id or "")), None)
         route_fingerprint = safe_fingerprint(binding.get("route_id"))
@@ -2683,24 +3144,216 @@ def opaque_e2ee_identifier(value):
     return ""
 
 
-def normalized_e2ee_public_key(value):
+def e2ee_public_key_normalization_checkpoint(stage, request_id, timing_started_at, operation_started_at, input_length=0, decoded_length=0, valid=None, **fields):
+    active_http, active_websockets = companion_runtime_counts_unlocked()
+    parts = [
+        "[SOSYNC-E2EE-PUBLIC-KEY-NORMALIZE]",
+        f"requestID={request_id}",
+        f"correlationID={e2ee_session_correlation(request_id)}",
+        f"stage={stage}",
+        f"elapsedMs={elapsed_ms_since(timing_started_at or operation_started_at)}",
+        f"segmentElapsedMs={elapsed_ms_since(operation_started_at)}",
+        f"inputLength={input_length}",
+        f"decodedLength={decoded_length}",
+        f"thread={threading.get_ident()}",
+        f"activeHTTP={active_http}",
+        f"activeWebSockets={active_websockets}",
+    ]
+    if valid is not None:
+        parts.append(f"valid={str(bool(valid)).lower()}")
+    for key, value in fields.items():
+        parts.append(f"{key}={value}")
+    print(" ".join(parts), flush=True)
+
+
+def normalized_e2ee_public_key(value, request_id="unknown", timing_started_at=None, label="publicKey"):
+    operation_started_at = time.monotonic()
+    e2ee_public_key_normalization_checkpoint(
+        f"{label}.inputAcquired",
+        request_id,
+        timing_started_at,
+        operation_started_at,
+        input_length=len(str(value or ""))
+    )
     candidate = str(value or "").strip()
+    e2ee_public_key_normalization_checkpoint(
+        f"{label}.trimComplete",
+        request_id,
+        timing_started_at,
+        operation_started_at,
+        input_length=len(candidate)
+    )
     if not candidate:
+        e2ee_public_key_normalization_checkpoint(
+            f"{label}.return",
+            request_id,
+            timing_started_at,
+            operation_started_at,
+            input_length=0,
+            valid=False,
+            reason="empty"
+        )
         return ""
-    with timed_lock(E2EE_PUBLIC_KEY_NORMALIZATION_LOCK, "e2eePublicKeyNormalizationCache", log_threshold_ms=5):
+
+    cache_wait_started_at = time.monotonic()
+    e2ee_public_key_normalization_checkpoint(
+        f"{label}.cacheLookupLockWaitStart",
+        request_id,
+        timing_started_at,
+        operation_started_at,
+        input_length=len(candidate)
+    )
+    with timed_lock(E2EE_PUBLIC_KEY_NORMALIZATION_LOCK, "e2eePublicKeyNormalizationCache", request_id=request_id, log_threshold_ms=5):
+        cache_wait_ms = elapsed_ms_since(cache_wait_started_at)
+        e2ee_public_key_normalization_checkpoint(
+            f"{label}.cacheLookupLockAcquired",
+            request_id,
+            timing_started_at,
+            operation_started_at,
+            input_length=len(candidate),
+            lockWaitMs=cache_wait_ms
+        )
         cached = E2EE_PUBLIC_KEY_NORMALIZATION_CACHE.get(candidate)
+    e2ee_public_key_normalization_checkpoint(
+        f"{label}.cacheLookupComplete",
+        request_id,
+        timing_started_at,
+        operation_started_at,
+        input_length=len(candidate),
+        cacheHit=str(cached is not None).lower()
+    )
     if cached is not None:
+        e2ee_public_key_normalization_checkpoint(
+            f"{label}.return",
+            request_id,
+            timing_started_at,
+            operation_started_at,
+            input_length=len(candidate),
+            decoded_length=32,
+            valid=True,
+            reason="cacheHit"
+        )
         return cached
+
     try:
+        decode_started_at = time.monotonic()
+        e2ee_public_key_normalization_checkpoint(
+            f"{label}.base64DecodeStart",
+            request_id,
+            timing_started_at,
+            operation_started_at,
+            input_length=len(candidate)
+        )
         raw = base64url_decode(candidate)
+        e2ee_public_key_normalization_checkpoint(
+            f"{label}.base64DecodeComplete",
+            request_id,
+            timing_started_at,
+            decode_started_at,
+            input_length=len(candidate),
+            decoded_length=len(raw)
+        )
+        length_started_at = time.monotonic()
         if len(raw) != 32:
+            e2ee_public_key_normalization_checkpoint(
+                f"{label}.decodedLengthValidationComplete",
+                request_id,
+                timing_started_at,
+                length_started_at,
+                input_length=len(candidate),
+                decoded_length=len(raw),
+                valid=False
+            )
             return ""
+        e2ee_public_key_normalization_checkpoint(
+            f"{label}.decodedLengthValidationComplete",
+            request_id,
+            timing_started_at,
+            length_started_at,
+            input_length=len(candidate),
+            decoded_length=len(raw),
+            valid=True
+        )
+        import_started_at = time.monotonic()
+        e2ee_public_key_normalization_checkpoint(
+            f"{label}.publicKeyImportStart",
+            request_id,
+            timing_started_at,
+            operation_started_at,
+            input_length=len(candidate),
+            decoded_length=len(raw)
+        )
         x25519.X25519PublicKey.from_public_bytes(raw)
+        e2ee_public_key_normalization_checkpoint(
+            f"{label}.publicKeyImportComplete",
+            request_id,
+            timing_started_at,
+            import_started_at,
+            input_length=len(candidate),
+            decoded_length=len(raw),
+            valid=True
+        )
+        encode_started_at = time.monotonic()
+        e2ee_public_key_normalization_checkpoint(
+            f"{label}.canonicalEncodeStart",
+            request_id,
+            timing_started_at,
+            operation_started_at,
+            input_length=len(candidate),
+            decoded_length=len(raw)
+        )
         normalized = base64url_encode(raw)
-        with timed_lock(E2EE_PUBLIC_KEY_NORMALIZATION_LOCK, "e2eePublicKeyNormalizationCache", log_threshold_ms=5):
+        e2ee_public_key_normalization_checkpoint(
+            f"{label}.canonicalEncodeComplete",
+            request_id,
+            timing_started_at,
+            encode_started_at,
+            input_length=len(candidate),
+            decoded_length=len(raw),
+            valid=True
+        )
+        store_wait_started_at = time.monotonic()
+        e2ee_public_key_normalization_checkpoint(
+            f"{label}.cacheStoreLockWaitStart",
+            request_id,
+            timing_started_at,
+            operation_started_at,
+            input_length=len(candidate),
+            decoded_length=len(raw)
+        )
+        with timed_lock(E2EE_PUBLIC_KEY_NORMALIZATION_LOCK, "e2eePublicKeyNormalizationCache", request_id=request_id, log_threshold_ms=5):
+            store_wait_ms = elapsed_ms_since(store_wait_started_at)
+            e2ee_public_key_normalization_checkpoint(
+                f"{label}.cacheStoreLockAcquired",
+                request_id,
+                timing_started_at,
+                operation_started_at,
+                input_length=len(candidate),
+                decoded_length=len(raw),
+                lockWaitMs=store_wait_ms
+            )
             E2EE_PUBLIC_KEY_NORMALIZATION_CACHE[candidate] = normalized
+        e2ee_public_key_normalization_checkpoint(
+            f"{label}.return",
+            request_id,
+            timing_started_at,
+            operation_started_at,
+            input_length=len(candidate),
+            decoded_length=len(raw),
+            valid=True,
+            reason="normalized"
+        )
         return normalized
     except (ValueError, TypeError):
+        e2ee_public_key_normalization_checkpoint(
+            f"{label}.return",
+            request_id,
+            timing_started_at,
+            operation_started_at,
+            input_length=len(candidate),
+            valid=False,
+            reason="decodeOrImportError"
+        )
         return ""
 
 
